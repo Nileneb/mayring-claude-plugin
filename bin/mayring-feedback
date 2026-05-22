@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""CLI fallback for `mcp__claude_ai_Memory__feedback` when MCP session is dead.
+
+Issue #138 — after `/reload-plugins` the streamable-HTTP MCP session is
+terminated but tools still appear in the schema; every call comes back
+with `-32600 / "Session not found"`. Real signal is lost.
+
+This script writes the feedback to a local JSONL queue
+(`~/.config/mayring/feedback_queue.jsonl`). The SessionStart hook drains
+the queue against the REST API (`/memory/feedback`) — REST is
+session-immune, so as soon as the next session boots, queued feedback
+ships.
+
+Usage (via Bash tool when the MCP path errors):
+
+    mayring-feedback chunk_id signal [metadata-json]
+    mayring-feedback github-issue:mayringcoder:jwt-validation positive
+    mayring-feedback chk_a1b2c3d4e5f6g7h8 negative '{"task":"#138"}'
+
+The chunk_id may be a real `chk_…` id or a source_id slug — the REST
+endpoint resolves slug→chunks server-side (Issue #138 solution B).
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+QUEUE = Path(os.path.expanduser("~/.config/mayring/feedback_queue.jsonl"))
+
+
+def _usage_and_exit(code: int = 2) -> None:
+    sys.stderr.write(__doc__ or "")
+    sys.exit(code)
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 3:
+        _usage_and_exit()
+    chunk_id, signal = argv[1], argv[2]
+    # WHY(2026-05-10 rating-migration): nur rating '1'..'5'. Legacy
+    # positive/negative mapping NICHT — wir wollen keine fake-3en aus
+    # historischen scripts; user soll rating explizit setzen.
+    if signal not in ("1", "2", "3", "4", "5"):
+        sys.stderr.write(
+            f"signal must be a rating '1'..'5' (1=schadhaft, 3=neutral, "
+            f"5=primärquelle), got {signal!r}\n"
+        )
+        return 2
+    metadata: dict
+    if len(argv) >= 4:
+        try:
+            metadata = json.loads(argv[3])
+            if not isinstance(metadata, dict):
+                raise ValueError("metadata must be a JSON object")
+        except (ValueError, TypeError) as exc:
+            sys.stderr.write(f"invalid metadata JSON: {exc}\n")
+            return 2
+    else:
+        metadata = {}
+
+    QUEUE.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "chunk_id": chunk_id,
+        "signal": signal,
+        "metadata": metadata,
+        "queued_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    with QUEUE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+    print(f"queued: {chunk_id} → {signal}  ({QUEUE})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

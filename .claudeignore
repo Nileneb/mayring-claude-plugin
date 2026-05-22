@@ -1,0 +1,55 @@
+# Build-Artefakte
+public/build/
+public/js/filament/
+public/js/actions/
+public/js/forms/
+public/js/notifications/
+public/js/schemas/
+public/js/tables/
+public/fonts/
+
+# Vendor & Dependencies
+vendor/
+node_modules/
+
+# Compiled/Cached
+storage/
+bootstrap/cache/
+
+# Font-Dateien (binär, kein Nutzen für Code-Analyse)
+*.woff2
+*.woff
+*.ttf
+*.eot
+
+# Minified JS (Filament-Assets — keine eigenen Dateien)
+public/js/filament/**
+
+# Docker-Images (nur Config ist relevant, nicht die Build-Outputs)
+# docker/ bleibt drin — ist wichtig
+
+# IDE / Editor
+.idea/
+.vscode/
+
+# Serena Memories (KI-Agent-spezifischer Cache)
+.serena/memories/
+
+# Doku die schon in CLAUDE.md zusammengefasst ist
+IMPLEMENTATION_CHECKLIST.md
+SYNTHESIS_IMPLEMENTATION_COMPLETE.md
+basemodel.md
+
+# Große Blade-Templates die selten relevant sind
+resources/views/welcome.blade.php
+resources/css/welcome.css
+resources/js/welcome.js
+
+# Legal-Seiten (statischer Content, kein Code)
+resources/views/legal/
+
+/cache
+/.venv
+/.pytest_cache
+/AgentTemplates
+/prompts

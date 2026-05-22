@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""UserPromptSubmit hook: config-driven repo-watch — surfaces new CI fails,
+security alerts, Dependabot alerts, open PRs and assigned issues across a
+configurable set of repos, as a warning-block at the start of the prompt.
+
+User-Auftrag (2026-05-11): "wenn 1. irgendwas in der ci/cd pipeline scheitert
+2. im security/quality bereich etwas aufploppt → IMMER bei dir eine meldung
+erscheint, ich NICHT erst prompten muss". 2026-05-12 generalisiert (#243):
+nicht mehr 2 hardcoded repos × 3 fixe checks, sondern config-driven repos ×
+beliebige check-typen (ci · code_scanning · dependabot · pulls · issues).
+
+100% "ohne user-prompt" geht nicht (claude-code session ist user-getrieben).
+Aber: dieser hook läuft VOR jedem prompt → bei rotem CI / neuen alerts / neuen
+PRs injiziert er einen warning-block am promptanfang.
+
+Config: ~/.config/mayring/watch_repos.json (optional) —
+    {"repos": {"owner/name": ["ci","code_scanning","dependabot","pulls","issues"], ...}}
+Fehlt die Datei → eingebauter Default (MayringCoder + app.linn.games, ci+sec+dep).
+
+State-cache: ~/.config/mayring/ci_security_state.json — "neu seit letztem
+check"-detection pro (repo, check-typ), sonst spammt der hook bei jedem prompt.
+
+Output: NUR wenn etwas Neues — sonst silent skip.
+
+TODO(#243, v2): neue events zusätzlich ins Memory persistieren
+(`source_id=watch:<repo>:<type>:<id>`), damit man sie von claude.ai aus
+abfragen kann. v1 macht nur den inline-warning-block.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+_STATE_FILE = Path(os.path.expanduser("~/.config/mayring/ci_security_state.json"))
+_CONFIG_FILE = Path(os.path.expanduser("~/.config/mayring/watch_repos.json"))
+
+# Built-in default when ~/.config/mayring/watch_repos.json is absent.
+_DEFAULT_WATCH: dict[str, list[str]] = {
+    "Nileneb/MayringCoder": ["ci", "code_scanning", "dependabot"],
+    "Nileneb/app.linn.games": ["ci", "code_scanning", "dependabot", "pulls"],
+}
+
+# WHY(2026-05-11): "Automatic Dependency Submission" ist GitHubs auto-
+# dependency-graph-job (kein file im repo) — läuft auf jeden push inkl.
+# ephemeral feature-branches, aber wir squash-merge + delete-branch sofort →
+# "couldn't find remote ref" → fail. Harmlos, aber rauscht. Rausfiltern.
+_IGNORE_WORKFLOW_SUBSTRINGS = (
+    "automatic dependency submission",
+    "dependency submission",
+)
+
+
+def _gh(args: list[str], timeout: float = 8.0) -> dict | list | None:
+    """Run gh CLI silently, return parsed JSON or None on failure."""
+    try:
+        out = subprocess.run(["gh"] + args, capture_output=True, text=True, timeout=timeout)
+        if out.returncode != 0:
+            return None
+        return json.loads(out.stdout) if out.stdout.strip() else None
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
+        return None
+
+
+def _load_watch_config() -> dict[str, list[str]]:
+    """repo-slug → list of check-types. Falls back to the built-in default."""
+    try:
+        with open(_CONFIG_FILE) as f:
+            cfg = json.load(f)
+        repos = cfg.get("repos")
+        if isinstance(repos, dict) and repos:
+            # normalise: each value must be a non-empty list of known types
+            known = set(_CHECKS)
+            out: dict[str, list[str]] = {}
+            for slug, types in repos.items():
+                if isinstance(types, list):
+                    keep = [t for t in types if t in known]
+                    if keep:
+                        out[str(slug)] = keep
+            if out:
+                return out
+    except (OSError, json.JSONDecodeError, AttributeError):
+        pass
+    return dict(_DEFAULT_WATCH)
+
+
+def _load_state() -> dict:
+    try:
+        with open(_STATE_FILE) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_state(state: dict) -> None:
+    try:
+        _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(_STATE_FILE, "w") as f:
+            json.dump(state, f, indent=2)
+    except OSError:
+        pass
+
+
+def _seen(state: dict, key: str, repo: str) -> list:
+    return state.setdefault(key, {}).setdefault(repo, [])
+
+
+# --------------------------------------------------------------------------
+# Individual checks — each returns warning lines (and mutates `state`)
+# --------------------------------------------------------------------------
+
+def _check_ci(repo: str, state: dict) -> list[str]:
+    """New CI failures since last check (limit 30 — active repos burn through
+    a smaller window before the hook sees them)."""
+    runs = _gh(["run", "list", "--repo", repo, "--limit", "30",
+                "--json", "databaseId,name,conclusion,status,event"])
+    if not runs:
+        return []
+    warnings: list[str] = []
+    seen = _seen(state, "failed_runs", repo)
+    new_ids = []
+    for r in runs:
+        if r.get("conclusion") == "failure" and r.get("status") == "completed":
+            rid = str(r.get("databaseId"))
+            if rid in seen:
+                continue
+            new_ids.append(rid)
+            if any(sub in str(r.get("name", "")).lower() for sub in _IGNORE_WORKFLOW_SUBSTRINGS):
+                continue  # record-as-seen but don't surface
+            warnings.append(f"- **{repo} CI**: `{r.get('name')}` FAILED "
+                            f"(run {rid}, trigger={r.get('event')})")
+    if new_ids:
+        state["failed_runs"][repo] = (seen + new_ids)[-50:]
+    return warnings
+
+
+def _check_security(repo: str, state: dict) -> list[str]:
+    """New open code-scanning (CodeQL) alerts since last check."""
+    alerts = _gh(["api", f"repos/{repo}/code-scanning/alerts?state=open",
+                  "--jq", "[.[] | {n:.number, rule:.rule.id, severity:.rule.severity}]"])
+    if alerts is None:
+        return []
+    cur = sorted(a.get("n") for a in alerts if a.get("n"))
+    prev = state.setdefault("alert_counts", {}).get(repo, [])
+    new = [n for n in cur if n not in prev]
+    state["alert_counts"][repo] = cur
+    if not new:
+        return []
+    sev = {n: next((a["severity"] for a in alerts if a.get("n") == n), "?") for n in new}
+    return [f"- **{repo} Security**: {len(new)} NEUE code-scanning alert(s): "
+            + ", ".join(f"#{n}({s})" for n, s in sev.items())]
+
+
+def _check_dependabot(repo: str, state: dict) -> list[str]:
+    """New open Dependabot alerts (vulnerable deps) since last check."""
+    alerts = _gh(["api", f"repos/{repo}/dependabot/alerts?state=open&per_page=100",
+                  "--jq", "[.[] | {n:.number, pkg:.dependency.package.name, "
+                          "sev:.security_advisory.severity}]"])
+    if alerts is None:
+        return []
+    cur = sorted(a.get("n") for a in alerts if a.get("n") is not None)
+    prev = state.setdefault("dependabot_counts", {}).get(repo, [])
+    new = [n for n in cur if n not in prev]
+    state["dependabot_counts"][repo] = cur
+    if not new:
+        return []
+    by_n = {a["n"]: a for a in alerts}
+    parts = [f"#{n} {by_n.get(n, {}).get('pkg', '?')}({by_n.get(n, {}).get('sev', '?')})" for n in new]
+    return [f"- **{repo} Dependabot**: {len(new)} NEUE alert(s): {', '.join(parts)} "
+            f"→ https://github.com/{repo}/security/dependabot"]
+
+
+def _check_pulls(repo: str, state: dict) -> list[str]:
+    """New open PRs since last check (so a freshly-opened PR — e.g. a
+    Dependabot bump or a Copilot fix — surfaces without you having to look)."""
+    prs = _gh(["pr", "list", "--repo", repo, "--state", "open", "--limit", "40",
+               "--json", "number,title,isDraft,author"])
+    if prs is None:
+        return []
+    seen = _seen(state, "open_prs", repo)
+    new = [p for p in prs if str(p.get("number")) not in seen]
+    # state = exactly the currently-open set (so closed/merged PRs drop out)
+    state["open_prs"][repo] = [str(p.get("number")) for p in prs]
+    if not new:
+        return []
+    parts = []
+    for p in new:
+        draft = " (draft)" if p.get("isDraft") else ""
+        author = (p.get("author") or {}).get("login", "?")
+        parts.append(f"#{p.get('number')} \"{str(p.get('title', ''))[:60]}\" [{author}]{draft}")
+    return [f"- **{repo} PRs**: {len(new)} neue open PR(s): " + " · ".join(parts)]
+
+
+def _check_issues(repo: str, state: dict) -> list[str]:
+    """New issues assigned to you since last check (off by default — add
+    "issues" to a repo's watch-list to enable)."""
+    issues = _gh(["issue", "list", "--repo", repo, "--state", "open",
+                  "--assignee", "@me", "--limit", "40", "--json", "number,title"])
+    if issues is None:
+        return []
+    seen = _seen(state, "assigned_issues", repo)
+    new = [i for i in issues if str(i.get("number")) not in seen]
+    state["assigned_issues"][repo] = [str(i.get("number")) for i in issues]
+    if not new:
+        return []
+    parts = [f"#{i.get('number')} \"{str(i.get('title', ''))[:60]}\"" for i in new]
+    return [f"- **{repo} Issues** (assigned): {len(new)} neu: " + " · ".join(parts)]
+
+
+_CHECKS = {
+    "ci": _check_ci,
+    "code_scanning": _check_security,
+    "dependabot": _check_dependabot,
+    "pulls": _check_pulls,
+    "issues": _check_issues,
+}
+
+
+def main() -> int:
+    watch = _load_watch_config()
+    state = _load_state()
+    warnings: list[str] = []
+
+    for repo, types in watch.items():
+        for t in types:
+            fn = _CHECKS.get(t)
+            if fn is None:
+                continue
+            try:
+                warnings.extend(fn(repo, state))
+            except Exception:
+                # one flaky check must not kill the whole hook — but DON'T
+                # swallow silently: surface it so a broken check is visible.
+                warnings.append(f"- **{repo} {t}**: watch-check raised (see hook) — investigate")
+
+    _save_state(state)
+
+    if warnings:
+        print("## ⚠️ Repo-Watch (neu seit letztem prompt)\n")
+        for w in warnings:
+            print(w)
+        print("")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
