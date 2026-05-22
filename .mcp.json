@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "memory-agents": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/run_local_mcp.sh",
+      "cwd": "${CLAUDE_PLUGIN_ROOT}/..",
+      "env": {
+        "PYTHONPATH": "${CLAUDE_PLUGIN_ROOT}/.."
+      }
+    }
+  }
+}
