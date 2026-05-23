@@ -38,10 +38,33 @@ except ImportError:
 # Phase 2: Codebook-Kategorien aus der DB (Phase 1, via session_ctx.json) statt
 # aus einer hardcoded lokalen universal.yaml. Fail-soft → YAML/Minimal-Fallback.
 try:
-    from _session_ctx import load_active_categories as _ctx_load_categories
+    from _session_ctx import (
+        load_active_categories as _ctx_load_categories,
+        route_project as _route_project,
+        _git_remote,
+        derive_task as _derive_task,
+        read_session_ctx as _read_session_ctx,
+        write_session_ctx_field as _write_session_ctx_field,
+    )
 except ImportError:
     def _ctx_load_categories(token: str = "") -> list:  # type: ignore[misc]
         return []
+
+    def _route_project(*_a, **_k) -> dict:  # type: ignore[misc]
+        return {"project_id": None, "name": None, "mode": "unknown",
+                "reason": "no-module"}
+
+    def _git_remote(*_a, **_k):  # type: ignore[misc]
+        return None
+
+    def _derive_task(*_a, **_k) -> str:  # type: ignore[misc]
+        return ""
+
+    def _read_session_ctx(*_a, **_k):  # type: ignore[misc]
+        return None
+
+    def _write_session_ctx_field(*_a, **_k) -> None:  # type: ignore[misc]
+        return None
 
 # WHY(v2-pinned-sources): User-Auftrag — "WIE BEKOMMEN WIR DEIN
 # NUTZLOSES SELBST ERSTELLTES FEEDBACK IN JEDEN SCHEISS PROMPT ALS
@@ -118,6 +141,7 @@ def _search(
     query: str, token: str, *, top_k: int = TOP_K_PRIMARY,
     source_type: str | None = None, char_budget: int = CHAR_BUDGET,
     category_hint: list[str] | None = None,
+    project_id: str | None = None, task_context: str = "",
 ) -> dict:
     """Run one /memory/search lens.
 
@@ -146,6 +170,10 @@ def _search(
         body_dict["source_type"] = source_type
     if category_hint:
         body_dict["category_hint"] = category_hint
+    if project_id:
+        body_dict["project"] = project_id
+    if task_context:
+        body_dict["task_context"] = task_context
     body = json.dumps(body_dict).encode()
     req = urllib.request.Request(
         f"{API}/memory/search",
@@ -279,7 +307,9 @@ def _categorize_prompt(prompt: str, token: str = "") -> list[str]:
 
 
 def _multi_lens_search(query: str, token: str, *,
-                       category_hint: list[str] | None = None) -> dict[str, dict]:
+                       category_hint: list[str] | None = None,
+                       project_id: str | None = None,
+                       task_context: str = "") -> dict[str, dict]:
     """Run three lens-searches concurrently; one entry per lens.
 
     Each value is either a real search response or a `{_hook_error: ...}`
@@ -287,9 +317,12 @@ def _multi_lens_search(query: str, token: str, *,
     surfaces as `_hook_error` so the user actually sees what's wrong.
     """
     lenses: dict[str, dict] = {
-        "primary":      {"category_hint": category_hint},
-        "ambient":      {"source_type": "ambient_snapshot", "top_k": TOP_K_LENS, "char_budget": 1000},
-        "conversation": {"source_type": "conversation_summary", "top_k": TOP_K_LENS, "char_budget": 1000},
+        "primary":      {"category_hint": category_hint, "project_id": project_id,
+                          "task_context": task_context},
+        "ambient":      {"source_type": "ambient_snapshot", "top_k": TOP_K_LENS,
+                          "char_budget": 1000, "project_id": project_id},
+        "conversation": {"source_type": "conversation_summary", "top_k": TOP_K_LENS,
+                          "char_budget": 1000, "project_id": project_id},
     }
     results: dict[str, dict] = {n: {"_hook_error": "lens did not complete in time"}
                                 for n in lenses}
@@ -424,7 +457,30 @@ def main() -> None:
     # einfach ohne hint suchen (ungefilterter fallback).
     prompt_categories = _categorize_prompt(prompt, token)
 
-    results = _multi_lens_search(prompt, token, category_hint=prompt_categories or None)
+    # Project Router (Slice 1): einmal pro Session routen, in session_ctx.json
+    # cachen, project_id + task an die Suche durchreichen.
+    ctx = _read_session_ctx() or {}
+    active = ctx.get("active_project")
+    # Re-route bei fehlendem ODER transient gescheitertem (route-unreachable)
+    # Cache — sonst friert ein Cold-Start (9s-Deploy-Window) das Routing für die
+    # ganze Session auf "workspace-weit" ein.
+    if active is None or (active or {}).get("reason") == "route-unreachable":
+        active = _route_project(token, _git_remote(), prompt)
+        if (active or {}).get("reason") != "route-unreachable":
+            _write_session_ctx_field("active_project", active)
+    project_id = (active or {}).get("project_id")
+    task = _derive_task(prompt, (active or {}).get("name") or "")
+    if active and project_id:
+        proj_line = (f"📁 Projekt: {active.get('name') or project_id} "
+                     f"({active.get('mode', '?')}, conf={active.get('confidence', 0)} "
+                     f"· {active.get('reason', '?')})"
+                     + (f" · task={task}" if task else "") + "\n\n")
+    else:
+        proj_line = f"📁 Projekt: — (workspace-weit, {(active or {}).get('mode', '?')})\n\n"
+    pinned_prefix = proj_line + pinned_prefix
+
+    results = _multi_lens_search(prompt, token, category_hint=prompt_categories or None,
+                                 project_id=project_id, task_context=task)
     primary = results.get("primary") or {}
     if "_hook_error" in primary:
         # Sonderfall: deploy-typische 5xx (502/503/504) sind transient
