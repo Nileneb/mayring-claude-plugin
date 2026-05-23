@@ -29,7 +29,7 @@ except ImportError:
         return {}
 _DEFAULT_CHROMA = os.path.expanduser("~/.cache/mayringcoder/chroma")
 _DEFAULT_WS = os.environ.get("MAYRING_WORKSPACE_ID", "default")
-_OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://three.linn.games")
+_OLLAMA_URL = os.environ.get("OLLAMA_URL", "https://three.linn.games")
 _EMBED_MODEL = "nomic-embed-text"
 _BATCH_SIZE = 200
 _TIMEOUT = 30
