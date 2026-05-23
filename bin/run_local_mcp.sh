@@ -121,6 +121,21 @@ if [ "$needs_bootstrap" = "1" ]; then
     echo "run_local_mcp: bootstrap complete" >&2
 fi
 
+# --- 1b. mayring_core (post-#267 split) ---------------------------------------
+# WHY(#267): core/ was extracted into the editable `mayring-core` package, but
+# requirements-client.txt does NOT pull it (it lives in the MayringCoder repo,
+# not on PyPI). Without it `src.api.local_mcp` dies on `import mayring_core` and
+# the MCP server silently fails to connect. Idempotent self-heal — also repairs
+# venvs bootstrapped before the package existed; a no-op once installed.
+if ! "$VENV_PYTHON" -c "import mayring_core" >/dev/null 2>&1; then
+    if [ -f "$REPO_ROOT/core/pyproject.toml" ]; then
+        echo "run_local_mcp: installing mayring_core (editable) from $REPO_ROOT/core" >&2
+        "$VENV_DIR/bin/pip" install -q -e "$REPO_ROOT/core" >&2
+    else
+        echo "run_local_mcp: WARNING — $REPO_ROOT/core not found; mayring_core unavailable, MCP will fail" >&2
+    fi
+fi
+
 # --- 2. JWT (best-effort, do NOT block MCP-start) ---------------------------
 JWT_FILE="${MAYRING_HOOK_JWT:-$HOME/.config/mayring/hook.jwt}"
 if [ ! -s "$JWT_FILE" ] && [ -f "$REPO_ROOT/tools/oauth_install.py" ]; then
