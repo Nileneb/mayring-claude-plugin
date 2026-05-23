@@ -51,6 +51,15 @@ except ImportError:
     def heartbeat(*_a, **_k) -> None:  # type: ignore[misc]
         pass
 
+# Phase 2: einmal pro Session den DB-Codebook (Phase 1) nach session_ctx.json
+# cachen, damit memory_inject pro Prompt nicht die hardcoded universal.yaml
+# parst (die nur auf der dev-Maschine existierte).
+try:
+    from _session_ctx import write_session_ctx as _write_session_ctx
+except ImportError:
+    def _write_session_ctx(*_a, **_k):  # type: ignore[misc]
+        return None
+
 
 PLANS_DIR = os.path.expanduser("~/.claude/plans")
 TASK_CONTEXT_BUDGET = 800
@@ -535,5 +544,6 @@ if __name__ == "__main__":
     _drain_feedback_queue()
     _drain_ingest_queue()
     _warn_if_silent_skips_accumulated()
+    _write_session_ctx(_load_token())  # Phase 2: DB-codebook → session_ctx.json
     payload = json.loads(sys.stdin.read() or "{}")
     _inject_memory(payload)

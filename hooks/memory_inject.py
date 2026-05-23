@@ -35,6 +35,14 @@ except ImportError:
     def report_hook_event(*_a, **_k) -> None:  # type: ignore[misc]
         pass
 
+# Phase 2: Codebook-Kategorien aus der DB (Phase 1, via session_ctx.json) statt
+# aus einer hardcoded lokalen universal.yaml. Fail-soft → YAML/Minimal-Fallback.
+try:
+    from _session_ctx import load_active_categories as _ctx_load_categories
+except ImportError:
+    def _ctx_load_categories(token: str = "") -> list:  # type: ignore[misc]
+        return []
+
 # WHY(v2-pinned-sources): User-Auftrag — "WIE BEKOMMEN WIR DEIN
 # NUTZLOSES SELBST ERSTELLTES FEEDBACK IN JEDEN SCHEISS PROMPT ALS
 # KONTEXT?". Hier: ein file-Pfad-Liste die UNABHÄNGIG vom search-result
@@ -197,55 +205,25 @@ _CATEGORIZE_CACHED: dict | None = None
 _MIN_PROMPT_SIM_THRESHOLD = 0.4   # darunter → "no prior context"
 
 
-def _load_active_categories() -> list[str]:
-    """Universal codebook-categories als domäne für prompt-categorize.
+def _load_active_categories(token: str = "") -> list[str]:
+    """Codebook-Kategorien als Domäne für prompt-categorize.
 
-    WHY: User-design — wir nutzen das schon existierende mayring-kategorien-
-    system (codebooks/profiles) statt eigene labels zu erfinden. Universal
-    ist sprachunabhängig + reicht für 90% der prompts.
+    Delegiert an _session_ctx.load_active_categories: DB-Codebook (Phase 1,
+    via session_ctx.json, gerätunabhängig) → YAML → Minimal-Set. Ersetzt den
+    früheren hardcoded Pfad /home/nileneb/Desktop/MayringCoder/.../universal.yaml,
+    der nur auf der dev-Maschine existierte.
     """
     global _CATEGORIZE_CACHED
     if _CATEGORIZE_CACHED is not None:
         return _CATEGORIZE_CACHED
-    paths = [
-        "/home/nileneb/Desktop/MayringCoder/codebooks/profiles/universal.yaml",
-        os.path.expanduser("~/.config/mayring/categories.txt"),
-    ]
-    cats: list[str] = []
-    for p in paths:
-        if not os.path.exists(p):
-            continue
-        try:
-            with open(p, encoding="utf-8") as f:
-                content = f.read()
-            # crude yaml-list parse — vermeidet pyyaml-dependency im hook
-            in_cats = False
-            for line in content.splitlines():
-                stripped = line.strip()
-                if stripped.startswith("categories:"):
-                    in_cats = True
-                    continue
-                if in_cats:
-                    if stripped.startswith("- "):
-                        cat = stripped[2:].strip().rstrip(":")
-                        if cat and not cat.startswith("#"):
-                            cats.append(cat)
-                    elif stripped and not stripped.startswith("#") and ":" in stripped:
-                        # next key — end of categories block
-                        break
-            if cats:
-                break
-        except OSError:
-            continue
-    _CATEGORIZE_CACHED = cats or [
-        # absolute fallback wenn codebook nicht gefunden
+    _CATEGORIZE_CACHED = _ctx_load_categories(token) or [
         "api", "data_access", "domain", "infrastructure", "auth",
         "config", "utils", "testing", "frontend", "deployment",
     ]
     return _CATEGORIZE_CACHED
 
 
-def _categorize_prompt(prompt: str) -> list[str]:
+def _categorize_prompt(prompt: str, token: str = "") -> list[str]:
     """Ask mistral:7b-instruct welche kategorien der user-prompt berührt.
 
     Returns 1..3 kategorien aus _load_active_categories(). Bei timeout/
@@ -253,7 +231,7 @@ def _categorize_prompt(prompt: str) -> list[str]:
     """
     if not prompt or len(prompt) < MIN_PROMPT_LEN:
         return []
-    cats = _load_active_categories()
+    cats = _load_active_categories(token)
     if not cats:
         return []
     cat_list = ", ".join(cats[:60])  # truncate auf ~60 zum prompt-budget
@@ -444,7 +422,7 @@ def main() -> None:
     # deployment) → wir geben sie als hint an die search weiter damit
     # treffer in passenden kategorien hoch-gerankt werden. Bei timeout/leer
     # einfach ohne hint suchen (ungefilterter fallback).
-    prompt_categories = _categorize_prompt(prompt)
+    prompt_categories = _categorize_prompt(prompt, token)
 
     results = _multi_lens_search(prompt, token, category_hint=prompt_categories or None)
     primary = results.get("primary") or {}
