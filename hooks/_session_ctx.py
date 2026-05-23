@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -142,3 +144,68 @@ def load_active_categories(token: str = "") -> list[str]:
     if ctx and ctx.get("categories"):
         return [c["name"] for c in ctx["categories"] if c.get("name")]
     return _yaml_categories() or list(_MINIMAL)
+
+
+# --- Project Router (Slice 1) ----------------------------------------------
+
+_IMPERATIVES = re.compile(
+    r"\b(implementier\w*|implement|fix|repariere?|debug\w*|analysier\w*|analyze|"
+    r"refactor\w*|erstell\w*|create|add|füge|baue?|build|teste?|test|deploy\w*|"
+    r"migrier\w*|migrate|untersuch\w*|investigate|optimier\w*|optimize|review|"
+    r"prüf\w*|check|schreib\w*|write|entferne?|remove|delete|lösch\w*|"
+    r"update|aktualisier\w*)\b", re.IGNORECASE)
+
+
+def _git_remote(cwd: str | None = None) -> str | None:
+    """`git -C <cwd> remote get-url origin`, fail-soft → None."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", cwd or os.getcwd(), "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=2)
+        out = r.stdout.strip()
+        return out or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def route_project(token: str, cwd_remote: str | None, prompt: str) -> dict:
+    """POST /projects/route, fail-soft → {project_id: None}."""
+    api = _api()
+    body = json.dumps({"cwd_remote": cwd_remote, "prompt": (prompt or "")[:600]}).encode()
+    req = urllib.request.Request(
+        f"{api}/projects/route", data=body,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            return json.loads(resp.read())
+    except (urllib.error.URLError, OSError, ValueError):
+        return {"project_id": None, "name": None, "mode": "unknown",
+                "confidence": 0.0, "reason": "route-unreachable"}
+
+
+def derive_task(prompt: str, project_name: str = "", goal: str = "") -> str:
+    """Mayring-Selektionskriterium: Imperativ + Objekt, mit Projekt/Goal-Kontext.
+    Regex-first; leerer String wenn nichts Sinnvolles (caller fällt zurück)."""
+    p = (prompt or "").strip()
+    if len(p) < 12:
+        return ""
+    m = _IMPERATIVES.search(p)
+    seed = p[m.start():m.start() + 100].split("\n")[0].strip() if m else ""
+    if not seed and goal:
+        seed = goal[:80]
+    if not seed:
+        return ""
+    prefix = f"{project_name}: " if project_name else ""
+    return (prefix + seed)[:140]
+
+
+def write_session_ctx_field(key: str, value) -> None:
+    """Merge a single field into session_ctx.json (best-effort, TTL-agnostic)."""
+    ctx = read_session_ctx(max_age=0) or {}
+    ctx[key] = value
+    try:
+        os.makedirs(os.path.dirname(SESSION_CTX_PATH), exist_ok=True)
+        with open(SESSION_CTX_PATH, "w", encoding="utf-8") as f:
+            json.dump(ctx, f)
+    except OSError:
+        pass
