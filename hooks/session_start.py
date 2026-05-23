@@ -38,6 +38,19 @@ except ImportError:
     def _silent_skip_should_warn(threshold: int = 5, window_hours: float = 24.0) -> bool:  # type: ignore[misc]
         return False
 
+# Device↔Cloud-Kanal (#5): einmal pro Session registrieren + SessionStart melden.
+try:
+    from _device import register_device, report_hook_event, heartbeat
+except ImportError:
+    def register_device(*_a, **_k) -> None:  # type: ignore[misc]
+        pass
+
+    def report_hook_event(*_a, **_k) -> None:  # type: ignore[misc]
+        pass
+
+    def heartbeat(*_a, **_k) -> None:  # type: ignore[misc]
+        pass
+
 
 PLANS_DIR = os.path.expanduser("~/.claude/plans")
 TASK_CONTEXT_BUDGET = 800
@@ -516,6 +529,9 @@ if __name__ == "__main__":
     repo_root = _repo_root(plugin_root)
     _sync_plugin_files_from_repo(plugin_root, repo_root)
     _bootstrap_if_needed()
+    register_device()  # einmal pro Session, idempotent, best-effort (#5)
+    report_hook_event("SessionStart")
+    heartbeat()
     _drain_feedback_queue()
     _drain_ingest_queue()
     _warn_if_silent_skips_accumulated()

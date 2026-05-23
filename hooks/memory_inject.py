@@ -23,6 +23,18 @@ import urllib.error
 JWT_FILE = os.path.expanduser("~/.config/mayring/hook.jwt")
 API = os.getenv("MAYRING_API_URL", "https://mcp.linn.games").rstrip("/")
 
+# Device↔Cloud-Kanal (#5): X-Device-Id auf Cloud-Calls + best-effort Hook-Report.
+# no-op-Fallback wenn das Sister-Modul fehlt (alter Snapshot).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from _device import device_headers, report_hook_event
+except ImportError:
+    def device_headers() -> dict:  # type: ignore[misc]
+        return {}
+
+    def report_hook_event(*_a, **_k) -> None:  # type: ignore[misc]
+        pass
+
 # WHY(v2-pinned-sources): User-Auftrag — "WIE BEKOMMEN WIR DEIN
 # NUTZLOSES SELBST ERSTELLTES FEEDBACK IN JEDEN SCHEISS PROMPT ALS
 # KONTEXT?". Hier: ein file-Pfad-Liste die UNABHÄNGIG vom search-result
@@ -133,6 +145,7 @@ def _search(
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
+            **device_headers(),
         },
     )
     # Retry on 502/503/504 — common during MayringCoder deploy windows
@@ -418,6 +431,8 @@ def main() -> None:
     token = _load_token()
     if not token:
         return
+
+    report_hook_event("UserPromptSubmit", token, summary=prompt)  # best-effort (#5)
 
     # Pinned-block IMMER vorab — auch wenn search server down ist, sollen
     # die User-Constraints (master-audit, frust-patterns, spec) sichtbar sein.
