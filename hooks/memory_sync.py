@@ -19,6 +19,14 @@ from pathlib import Path
 _API_URL = os.environ.get("MAYRING_API_URL", "https://mcp.linn.games").rstrip("/")
 _JWT_FILE = os.path.expanduser("~/.config/mayring/hook.jwt")
 _DEFAULT_DB = os.path.expanduser("~/.cache/mayringcoder/memory.db")
+
+# Device↔Cloud-Kanal (#5): X-Device-Id auch auf den Sync-Calls.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from _device import device_headers
+except ImportError:
+    def device_headers() -> dict:  # type: ignore[misc]
+        return {}
 _DEFAULT_CHROMA = os.path.expanduser("~/.cache/mayringcoder/chroma")
 _DEFAULT_WS = os.environ.get("MAYRING_WORKSPACE_ID", "default")
 _OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://three.linn.games")
@@ -78,7 +86,7 @@ def _fetch_changes(token: str, workspace_id: str, since: str, limit: int = _BATC
     params = urllib.parse.urlencode({"since": since, "workspace_id": workspace_id, "limit": limit})
     req = urllib.request.Request(
         f"{_API_URL}/memory/changes?{params}",
-        headers={"Authorization": f"Bearer {token}"},
+        headers={"Authorization": f"Bearer {token}", **device_headers()},
     )
     resp = urllib.request.urlopen(req, timeout=_TIMEOUT)
     return json.loads(resp.read())
