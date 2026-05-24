@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """UserPromptSubmit hook: inject relevant memory chunks into the prompt.
 
-Three parallel /search calls per prompt give a multi-lens view:
-  - generic semantic search (current task)
+Three /search calls per prompt give a multi-lens view:
+  - generic semantic search (current task)        [primary]
   - ambient_snapshot lens (project-level context)
   - conversation_summary lens (what was decided/done before)
 
-Three queries run concurrently with strict timeouts so the hook never blocks
-input for more than ~3 s total. Cheap-fail when JWT missing or API down.
+The queries run SEQUENTIALLY, primary first, each with a strict timeout. They
+used to run concurrently, but the single-worker API serialises concurrent
+searches into 9s timeouts — sequential lets the primary lens reliably return
+(see _run_lenses). Cheap-fail when JWT missing or API down.
 """
 from __future__ import annotations
 
-import concurrent.futures as _cf
 import json
 import os
 import re
@@ -105,7 +106,7 @@ def _record_silent_skip(reason: str) -> None:
 # of vector + symbolic. Sub-4s timeouts caused every prompt to fall through
 # to "Suche fehlgeschlagen" even though the API itself was healthy.
 TIMEOUT = 9.0           # per-request
-GLOBAL_TIMEOUT = 12.0   # whole hook (3 lenses run concurrently)
+GLOBAL_TIMEOUT = 12.0   # whole hook (3 lenses run sequentially, primary first)
 TOP_K_PRIMARY = 4
 TOP_K_LENS = 2          # per ambient/conv lens
 CHAR_BUDGET = 1800      # per call → ~5400 total max
@@ -310,11 +311,12 @@ def _multi_lens_search(query: str, token: str, *,
                        category_hint: list[str] | None = None,
                        project_id: str | None = None,
                        task_context: str = "") -> dict[str, dict]:
-    """Run three lens-searches concurrently; one entry per lens.
+    """Run the three lens-searches SEQUENTIALLY (primary first); one entry per lens.
 
     Each value is either a real search response or a `{_hook_error: ...}`
-    sentinel. Cancellation/timeout in the futures executor itself also
-    surfaces as `_hook_error` so the user actually sees what's wrong.
+    sentinel. Lenses that don't fit the GLOBAL_TIMEOUT budget keep their
+    pre-seeded sentinel. Sequential (not concurrent) because the single-worker
+    API serialises concurrent searches into timeouts — see the loop comment.
     """
     lenses: dict[str, dict] = {
         "primary":      {"category_hint": category_hint, "project_id": project_id,
@@ -326,21 +328,22 @@ def _multi_lens_search(query: str, token: str, *,
     }
     results: dict[str, dict] = {n: {"_hook_error": "lens did not complete in time"}
                                 for n in lenses}
-    with _cf.ThreadPoolExecutor(max_workers=3) as pool:
-        futures = {
-            pool.submit(_search, query, token, **kwargs): name
-            for name, kwargs in lenses.items()
-        }
+    # WHY(api-saturation 2026-05-24): the cloud API is a single uvicorn worker.
+    # Firing all three lenses CONCURRENTLY made them serialise on that one worker
+    # to 16-30s and ALL three blew the 9s per-request timeout → the user got zero
+    # memory. Run them SEQUENTIALLY in priority order instead: 'primary'
+    # (insertion-first) gets the worker alone (~4s < timeout) and reliably
+    # returns; the secondary snapshot lenses consume whatever GLOBAL_TIMEOUT
+    # budget is left. Proper fix is a multi-worker API (capacity spec) — this is
+    # the interim client-side mitigation.
+    _deadline = _time.monotonic() + GLOBAL_TIMEOUT
+    for name, kwargs in lenses.items():
+        if _time.monotonic() >= _deadline:
+            break  # out of budget → keep the pre-seeded sentinel for the rest
         try:
-            for fut in _cf.as_completed(futures, timeout=GLOBAL_TIMEOUT):
-                name = futures[fut]
-                try:
-                    results[name] = fut.result()
-                except Exception as exc:
-                    results[name] = {"_hook_error": f"{type(exc).__name__}: {exc}"}
-        except _cf.TimeoutError:
-            # Leave the pre-seeded "did not complete" sentinels in place.
-            pass
+            results[name] = _search(query, token, **kwargs)
+        except Exception as exc:
+            results[name] = {"_hook_error": f"{type(exc).__name__}: {exc}"}
     return results
 
 
