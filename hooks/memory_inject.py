@@ -157,14 +157,18 @@ def _search(
         "include_text": True,
         "char_budget": char_budget,
         # WHY(v2-llm-advisor-on): User-Auftrag — "GIBT ES EINEN GUTEN GRUND,
-        # EINEN LLM ADVISOR FÜR DUMME AI ZU HABEN??? ICH SAGE JA". Vorher
-        # default-disabled wegen 9s-budget; jetzt enabled mit kleinem
-        # qwen3.5:2b-Modell + top_k=5 (≤5s Budget). Der Advisor kennt
-        # die User-Regeln (KISS, no-legacy, no-silent) aus den
+        # EINEN LLM ADVISOR FÜR DUMME AI ZU HABEN??? ICH SAGE JA". Der Advisor
+        # kennt die User-Regeln (KISS, no-legacy, no-silent) aus den
         # always-injected pinned sources und nutzt sie als task_context.
+        # WHY(inject-timeout 2026-05-24): das vorherige qwen3.5:2b war ein
+        # THINKING-Modell — server-seitig 20 sequenzielle Calls × num_predict=8,
+        # </think> nie geschlossen → leere Antwort (Advisor inert) + ~12.5s/search
+        # → JEDER inject lief ins 9s-Timeout → 0 Chunks → kein Recall + kein
+        # Stop-Hook-Feedback. Server macht jetzt EINEN gebatchten Call; Modell
+        # = mistral:7b-instruct (non-thinking, ~0.5s warm, = Stop-Hook-Judge).
         "llm_prefilter": True,
         "llm_prefilter_model": os.environ.get(
-            "MAYRING_LLM_ADVISOR_MODEL", "qwen3.5:2b",
+            "MAYRING_LLM_ADVISOR_MODEL", "mistral:7b-instruct",
         ),
     }
     if source_type:
