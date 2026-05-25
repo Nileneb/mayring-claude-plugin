@@ -1,0 +1,38 @@
+name: repo-watch
+on:
+  workflow_call:
+    secrets:
+      MAYRING_TOKEN:
+        required: true
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: POST event to MayringCoder (best-effort)
+        continue-on-error: true
+        env:
+          MAYRING_TOKEN: ${{ secrets.MAYRING_TOKEN }}
+          API: ${{ vars.MAYRING_API_URL || 'https://mcp.linn.games' }}
+          EV: ${{ github.event_name }}
+          REPO: ${{ github.server_url }}/${{ github.repository }}
+          SHA: ${{ github.sha }}
+          REF: ${{ github.ref }}
+          CONCL: ${{ github.event.workflow_run.conclusion }}
+          WF: ${{ github.event.workflow_run.name }}
+        run: |
+          # WHY: loop guard (defense-in-depth; the caller's explicit workflow list
+          # already excludes mayring-watch so this should never fire).
+          if [ "$EV" = "workflow_run" ] && [ "$WF" = "repo-watch" ]; then
+            echo "self-run, skipping"; exit 0
+          fi
+          case "$EV" in
+            push) ETYPE=push ;;
+            workflow_run) ETYPE=workflow_run ;;
+            *) ETYPE="$EV" ;;
+          esac
+          curl -sS -m 10 -X POST "$API/repo-events" \
+            -H "Authorization: Bearer $MAYRING_TOKEN" -H 'Content-Type: application/json' \
+            -d "$(jq -nc --arg e "$ETYPE" --arg r "$REPO" --arg s "$SHA" --arg ref "$REF" \
+                     --arg c "$CONCL" --arg w "$WF" \
+                     '{event_type:$e, repo:$r, sha:$s, ref:$ref, conclusion:$c, workflow:$w}')" \
+            || echo "mayring repo-watch POST failed (non-fatal)"
