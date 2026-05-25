@@ -4,6 +4,8 @@ on:
     secrets:
       MAYRING_TOKEN:
         required: true
+permissions:
+  contents: read
 jobs:
   notify:
     runs-on: ubuntu-latest
