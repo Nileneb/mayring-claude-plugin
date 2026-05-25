@@ -1,6 +1,6 @@
 {
   "name": "mayring-coder",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "MayringCoder memory integration for Claude Code — hybrid memory hooks, device hook-event telemetry (#274), local memory-agents MCP.",
   "author": {
     "name": "Benedikt Linn",
