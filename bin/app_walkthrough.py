@@ -30,7 +30,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 BASE_DEFAULT = "https://app.linn.games"
-PROFILE = Path.home() / ".cache" / "app-walkthrough" / "profile"
+STATE_FILE = Path.home() / ".cache" / "app-walkthrough" / "state.json"
 OUT_DEFAULT = Path("/tmp/app-walkthrough")
 
 # Seed routes (the main authed pages). Link-discovery on /dashboard adds the rest.
@@ -79,10 +79,11 @@ def _dismiss_cookiebanner(page) -> None:
 
 
 def cmd_login(base: str) -> int:
-    PROFILE.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as p:
-        ctx = p.chromium.launch_persistent_context(str(PROFILE), headless=False)
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        browser = p.chromium.launch(headless=False)
+        ctx = browser.new_context()
+        page = ctx.new_page()
         page.goto(base + "/dashboard", wait_until="domcontentloaded")
         print("→ Log in via the opened window (GitHub OAuth). Waiting up to 180s …",
               file=sys.stderr)
@@ -96,7 +97,12 @@ def cmd_login(base: str) -> int:
             ok = _is_logged_in(page)
         except Exception:
             ok = _is_logged_in(page)
-        ctx.close()
+        if ok:
+            # storage_state persists ALL cookies (incl. the session-only Laravel
+            # cookie). A persistent_context drops session-only cookies on close,
+            # so headless re-runs landed on the login page ("NOT_LOGGED_IN").
+            ctx.storage_state(path=str(STATE_FILE))
+        browser.close()
     print("LOGIN_OK" if ok else "LOGIN_FAILED")
     return 0 if ok else 1
 
@@ -177,18 +183,19 @@ def _capture(page, route: str, base: str, out: Path) -> dict:
 
 def cmd_walk(base: str, seed: list[str], out: Path) -> int:
     out.mkdir(parents=True, exist_ok=True)
-    if not PROFILE.exists():
+    if not STATE_FILE.exists():
         print("NOT_LOGGED_IN: run with --login first", file=sys.stderr)
         return 2
     results: list[dict] = []
     with sync_playwright() as p:
-        ctx = p.chromium.launch_persistent_context(str(PROFILE), headless=True,
-                                                    viewport={"width": 1600, "height": 1000})
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        browser = p.chromium.launch(headless=True)
+        ctx = browser.new_context(storage_state=str(STATE_FILE),
+                                  viewport={"width": 1600, "height": 1000})
+        page = ctx.new_page()
         # auth check + link discovery from dashboard
         page.goto(base + "/dashboard", wait_until="networkidle", timeout=25_000)
         if not _is_logged_in(page):
-            ctx.close()
+            browser.close()
             print("NOT_LOGGED_IN: session expired — run --login again", file=sys.stderr)
             return 2
         _dismiss_cookiebanner(page)
@@ -201,7 +208,7 @@ def cmd_walk(base: str, seed: list[str], out: Path) -> int:
         for r in routes:
             print(f"  visiting {r}", file=sys.stderr)
             results.append(_capture(page, r, base, out))
-        ctx.close()
+        browser.close()
     report = out / "report.json"
     report.write_text(json.dumps({"base": base, "count": len(results),
                                   "pages": results}, indent=2))

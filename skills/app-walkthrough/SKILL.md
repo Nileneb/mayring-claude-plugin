@@ -30,7 +30,7 @@ SCRIPT="$(ls "$HOME"/.claude/plugins/cache/*/mayring-coder/*/bin/app_walkthrough
      && "$WV/bin/playwright" install chromium chromium-headless-shell
    ```
 
-2. **Ensure a session** (skip if `~/.cache/app-walkthrough/profile` exists and a
+2. **Ensure a session** (skip if `~/.cache/app-walkthrough/state.json` exists and a
    later walkthrough doesn't print `NOT_LOGGED_IN`). The login is headful — it
    opens a browser window; tell the user to sign in via GitHub, the script
    detects success and persists the session for all future headless runs:
