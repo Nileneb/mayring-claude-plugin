@@ -121,20 +121,39 @@ if [ "$needs_bootstrap" = "1" ]; then
     echo "run_local_mcp: bootstrap complete" >&2
 fi
 
-# --- 1b. mayring_core (post-#267 split) ---------------------------------------
-# WHY(#267): core/ was extracted into the editable `mayring-core` package, but
-# requirements-client.txt does NOT pull it (it lives in the MayringCoder repo,
-# not on PyPI). Without it `src.api.local_mcp` dies on `import mayring_core` and
-# the MCP server silently fails to connect. Idempotent self-heal — also repairs
-# venvs bootstrapped before the package existed; a no-op once installed.
-if ! "$VENV_PYTHON" -c "import mayring_core" >/dev/null 2>&1; then
-    if [ -f "$REPO_ROOT/core/pyproject.toml" ]; then
-        echo "run_local_mcp: installing mayring_core (editable) from $REPO_ROOT/core" >&2
-        "$VENV_DIR/bin/pip" install -q -e "$REPO_ROOT/core" >&2
-    else
-        echo "run_local_mcp: WARNING — $REPO_ROOT/core not found; mayring_core unavailable, MCP will fail" >&2
+# --- 1b. vendored packages (post-#266/#267 split) -----------------------------
+# WHY(#267,#266): `mayring_core` and `mayring_pi_agent` were extracted into
+# editable submodule packages. Neither is on PyPI nor pulled by
+# requirements-client.txt, so without them `src.api.local_mcp` dies on import and
+# the MCP server silently fails to reconnect (JSON-RPC -32000). Idempotent
+# self-heal: each install fires only when its import is missing, repairing venvs
+# bootstrapped before the split too. A no-op once both are present.
+_install_editable() {  # $1=module  $2=no_deps(0|1)  $3..=candidate dirs (first with pyproject wins)
+    local mod="$1" no_deps="$2"; shift 2
+    if "$VENV_PYTHON" -c "import $mod" >/dev/null 2>&1; then
+        return 0
     fi
-fi
+    local dir
+    for dir in "$@"; do
+        if [ -f "$dir/pyproject.toml" ]; then
+            echo "run_local_mcp: installing $mod (editable) from $dir" >&2
+            if [ "$no_deps" = "1" ]; then
+                "$VENV_DIR/bin/pip" install -q --no-deps -e "$dir" >&2
+            else
+                "$VENV_DIR/bin/pip" install -q -e "$dir" >&2
+            fi
+            return 0
+        fi
+    done
+    echo "run_local_mcp: WARNING — $mod package not found (looked in: $*); MCP will fail" >&2
+}
+
+# WHY(#267): mayring_core moved core/ → vendor/mayring-core; keep core/ as a
+# fallback for older clones. WHY(#266): mayring_pi_agent (vendor/mayring-pi-agent)
+# installs --no-deps so it does not re-pull MayringCoder and re-form the
+# vendor↔core dependency cycle the split removed.
+_install_editable mayring_core     0 "$REPO_ROOT/vendor/mayring-core" "$REPO_ROOT/core"
+_install_editable mayring_pi_agent 1 "$REPO_ROOT/vendor/mayring-pi-agent"
 
 # --- 2. JWT (best-effort, do NOT block MCP-start) ---------------------------
 JWT_FILE="${MAYRING_HOOK_JWT:-$HOME/.config/mayring/hook.jwt}"
