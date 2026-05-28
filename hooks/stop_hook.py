@@ -340,6 +340,12 @@ def clear_inject_state(session_id: str) -> None:
 
 
 _JUDGE_ENDPOINT_TIMEOUT = float(os.environ.get("MAYRING_JUDGE_TIMEOUT", "45"))
+# WHY(2026-05-28): telemetry label for the queue-routed judge. The /pi/judge-feedback
+# endpoint pins this model on its PiJob (src/api/routes/memory.py). Re-added after the
+# direct-Ollama→queue refactor (e358319) removed the old constant but left the reference
+# at the meta-build site → NameError crashed _auto_feedback whenever the judge returned
+# scores → NO feedback was ever posted from the CLI (silent broken loop).
+_JUDGE_MODEL = "mistral:7b-instruct"
 
 
 def _judge_chunks_via_queue(
