@@ -268,37 +268,40 @@ def _categorize_prompt(prompt: str, token: str = "") -> list[str]:
     if not cats:
         return []
     cat_list = ", ".join(cats[:60])  # truncate auf ~60 zum prompt-budget
+    prompt_text = (
+        f"User-prompt:\n{prompt[:600]}\n\n"
+        f"Verfügbare Kategorien: {cat_list}\n\n"
+        "Wähle 1-3 Kategorien die der prompt INHALTLICH berührt. "
+        "Ein prompt kann mehrere themen enthalten — gib ALLE relevanten an. "
+        "Antworte NUR mit kommaseparierten kategorie-namen aus der liste, "
+        "kein erklärtext. Beispiel: api, auth\n\nAntwort:"
+    )
+    # WHY(2026-05-28): route through the central /pi/run queue endpoint instead
+    # of POSTing Ollama directly — ALL llama jobs go through one place so they
+    # can be distributed/throttled. Fail-soft: queue slow/down → unfiltered.
     body = json.dumps({
+        "prompt": prompt_text,
+        "kind": "categorize",
         "model": _CATEGORIZE_MODEL,
-        "prompt": (
-            f"User-prompt:\n{prompt[:600]}\n\n"
-            f"Verfügbare Kategorien: {cat_list}\n\n"
-            "Wähle 1-3 Kategorien die der prompt INHALTLICH berührt. "
-            "Ein prompt kann mehrere themen enthalten — gib ALLE relevanten an. "
-            "Antworte NUR mit kommaseparierten kategorie-namen aus der liste, "
-            "kein erklärtext. Beispiel: api, auth\n\nAntwort:"
-        ),
-        "stream": False,
-        "options": {"num_predict": 32, "temperature": 0.1},
-        "think": False,
+        "timeout": _CATEGORIZE_TIMEOUT,
     }).encode()
     req = urllib.request.Request(
-        f"{_CATEGORIZE_OLLAMA}/api/generate",
+        f"{API}/pi/run",
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=_CATEGORIZE_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=_CATEGORIZE_TIMEOUT + 3) as resp:
             payload = json.loads(resp.read())
     except (urllib.error.URLError, OSError, TimeoutError, json.JSONDecodeError) as exc:
-        # Best-effort — Ollama unerreichbar / langsam → kein cat-filter
+        # Best-effort — Queue/Ollama unerreichbar / langsam → kein cat-filter
         sys.stderr.write(
             f"[memory_inject] prompt-categorize fail ({type(exc).__name__}) "
             f"→ ungefiltert\n"
         )
         return []
-    raw = (payload.get("response") or "").strip().lower()
+    raw = (payload.get("content") or "").strip().lower()
     # ',' or whitespace separated
     valid = {c.lower() for c in cats}
     matched: list[str] = []
