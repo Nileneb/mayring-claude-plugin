@@ -339,110 +339,54 @@ def clear_inject_state(session_id: str) -> None:
         pass
 
 
-_OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
-_JUDGE_MODEL = os.environ.get("MAYRING_JUDGE_MODEL", "mistral:7b-instruct")
-_JUDGE_TIMEOUT = float(os.environ.get("MAYRING_JUDGE_TIMEOUT", "20"))
+_JUDGE_ENDPOINT_TIMEOUT = float(os.environ.get("MAYRING_JUDGE_TIMEOUT", "45"))
 
 
-def _judge_chunks_with_llm(
+def _judge_chunks_via_queue(
     chunks: list[dict],
     user_prompt: str,
     assistant_text: str,
+    token: str,
     *,
-    ollama_url: str = _OLLAMA_URL,
-    model: str = _JUDGE_MODEL,
-    timeout: float = _JUDGE_TIMEOUT,
+    api_url: str = _API_URL,
+    timeout: float = _JUDGE_ENDPOINT_TIMEOUT,
 ) -> dict[str, str] | None:
-    """Batch-LLM judge: how much did the assistant USE each chunk's content?
+    """Rate chunk usage via the cloud /pi/judge-feedback endpoint.
 
-    Returns rating '1'..'5' per chunk:
-      1 = chunk content irrelevant / actively misleading
-      2 = barely related, didn't shape the answer
-      3 = neutral / loosely relevant
-      4 = clearly relevant, used to inform parts of the answer
-      5 = primary source — answer relies heavily on this chunk
-
-    WHY(2026-05-10 rating-migration): Pfad-Match (alte heuristik) hatte
-    zwei systematische biases:
-      - codebook.yaml/categorizer.py: positiv weil filename in jeder
-        meta-talk-antwort vorkommt — obwohl der inhalt nie hilfreich war.
-      - routes/web.php/MayringMcpClient.php: negativ weil generic files
-        selten beim namen genannt werden — der inhalt aber tatsächlich
-        verwendet wurde.
-    Rating-skala (statt binary) gibt reranker echten gradient statt
-    "war es nützlich ja/nein". Default-model mistral:7b-instruct hat
-    sich für mayring-kategorisierung am besten bewährt (2026-04-25 fix,
-    config/model_routes.yaml::mayring_code).
-
-    Returns: {chunk_id: "1".."5"} oder None bei error/no-text.
-    Caller fällt bei None zurück auf path-match-heuristik (legacy state).
+    WHY(2026-05-28): the judge used to POST Ollama DIRECTLY from this hook,
+    bypassing the server-side PiQueue → no bounded concurrency, hammered the
+    personal GPU on every Stop. Now it routes through the queue (kind='judge',
+    no memory aug, PI_CONCURRENCY-bounded). Returns {chunk_id: '1'..'5'} or None
+    (→ caller falls back to the path-match heuristic). Fire-and-forget safe.
     """
     chunks_with_text = [c for c in chunks if c.get("text")]
     if not chunks_with_text or not assistant_text:
         return None
-
-    # WHY(2026-05-11): source_id ABSICHTLICH NICHT mehr im prompt — der
-    # judge gewichtet sonst "thematische ähnlichkeit zum dateinamen" hoch
-    # (codebook.yaml bekam immer 5★ weil text "kategorien…" enthält und
-    # judge dachte "das ist die quelle für kategorisierungs-fragen"). Mit
-    # nur chunk-text vergleicht er rein inhaltliche evidenz.
-    numbered = "\n".join(
-        f"[{i+1}] {(c.get('text') or '')[:500].replace(chr(10), ' ')}"
-        for i, c in enumerate(chunks_with_text)
-    )
-    prompt = (
-        f"User asked:\n{user_prompt[:500] or '(unknown)'}\n\n"
-        f"Assistant answered:\n{assistant_text[:1500]}\n\n"
-        f"Memory chunks (numbered):\n{numbered}\n\n"
-        "Score each chunk by whether the ANSWER demonstrably uses INFORMATION "
-        "from that chunk — not by topic similarity, not by whether the chunk "
-        "looks 'important'. Evidence = the answer mentions specific facts, "
-        "names, numbers, code, or arguments that are visibly from this chunk.\n\n"
-        "If the answer would be IDENTICAL without this chunk → low rating, "
-        "regardless of how thematically related it is.\n\n"
-        "1 = no evidence the chunk shaped the answer (default for unused)\n"
-        "2 = vague overlap of topic, no specific borrowed content\n"
-        "3 = answer mentions something also in chunk, but might be coincidence\n"
-        "4 = answer clearly uses specific content from this chunk\n"
-        "5 = chunk is THE primary source; answer fails without it\n\n"
-        "IMPORTANT: most chunks score 1 or 2. 5 should be RARE. Be strict.\n\n"
-        f"Respond with EXACTLY {len(chunks_with_text)} comma-separated ratings "
-        "(1-5), in order. Example: 1,2,1,4,1\n\nAnswer:"
-    )
     body = json.dumps({
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {"num_predict": 64, "temperature": 0.0},
-        "think": False,
+        "user_prompt": (user_prompt or "")[:500],
+        "assistant_text": assistant_text[:1500],
+        "chunks": [
+            {"chunk_id": c["chunk_id"], "text": (c.get("text") or "")[:500]}
+            for c in chunks_with_text
+        ],
     }).encode()
     req = urllib.request.Request(
-        f"{ollama_url}/api/generate",
+        f"{api_url}/pi/judge-feedback",
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {token}", **device_headers()},
         method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            payload = json.loads(resp.read())
+            data = json.loads(resp.read())
+        scores = data.get("scores") or {}
+        return {str(k): str(v) for k, v in scores.items()} or None
     except (urllib.error.URLError, OSError, TimeoutError, json.JSONDecodeError) as exc:
-        sys.stderr.write(f"[stop_hook] judge fail ({type(exc).__name__}) — fallback path-match\n")
+        sys.stderr.write(
+            f"[stop_hook] queue-judge fail ({type(exc).__name__}) — fallback path-match\n"
+        )
         return None
-
-    raw = (payload.get("response") or "").strip()
-    tokens = [t.strip() for t in re.split(r"[,\s]+", raw) if t.strip()]
-    out: dict[str, str] = {}
-    for i, c in enumerate(chunks_with_text):
-        cid = c["chunk_id"]
-        if i >= len(tokens):
-            continue  # nicht genug antworten — skip
-        tok = tokens[i]
-        # nur die erste ziffer 1-5 nehmen ("4.", " 5", "rating: 3")
-        m = re.search(r"[1-5]", tok)
-        if m:
-            out[cid] = m.group(0)
-        # andere antwort → skip (kein eintrag)
-    return out
 
 
 def classify_chunk_relevance(source_id: str, assistant_text: str) -> str:
@@ -610,7 +554,7 @@ def _auto_feedback(turns: list[dict], session_id: str, token: str) -> None:
     # Try LLM-judge first (inhaltlicher signal). Only works wenn jeder
     # chunk text mitgebracht hat (state-format ≥2026-05-10) UND ollama
     # erreichbar ist. Fallback ist die path-match-heuristik.
-    judged = _judge_chunks_with_llm(chunks, user_text, assistant_text)
+    judged = _judge_chunks_via_queue(chunks, user_text, assistant_text, token)
 
     posted = 0
     skipped = 0
