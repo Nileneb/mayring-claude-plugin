@@ -235,7 +235,48 @@ _CATEGORIZE_TIMEOUT = float(os.environ.get("MAYRING_PROMPT_CATEGORIZE_TIMEOUT", 
 # WHY(2026-05-10 multi-category-prompt): cache categories pro repo-profile in
 # memory zum prompt-categorize-call. List wird einmal pro hook-process geladen.
 _CATEGORIZE_CACHED: dict | None = None
-_MIN_PROMPT_SIM_THRESHOLD = 0.4   # darunter → "no prior context"
+_MIN_PROMPT_SIM_THRESHOLD = 0.4   # roh-cosine-Boden für "no prior context"
+# WHY(out-of-context-rescue 2026-05-29): der 0.4-cosine-cutoff entmachtete den
+# trainierten Reranker-v2 beim Recall — ein chunk mit starkem Feedback+Recency
+# (score_final hoch) wurde verworfen wenn der ROHE cosine schwach war. Der
+# Reranker IST der bessere Rausch-Proxy (integriert vector+symbolic+feedback+
+# recency+cat_match). Gate jetzt additiv: cosine≥0.4 ODER score_final≥dieser
+# Schwelle. Kann Recall nie verschlechtern (rein additiv). Env-tunbar.
+_MIN_RERANK_SCORE = float(os.environ.get("MAYRING_MIN_RERANK_SCORE", "0.45"))
+
+
+def _max_sim(r: dict) -> float:
+    """Roh-cosine max_score aus dem vector_stage-Diagnostic einer Lens."""
+    diag = (r or {}).get("diagnostics") or {}
+    vs = diag.get("vector_stage") or ""
+    m = re.search(r"max_score=([0-9.]+)", vs if isinstance(vs, str) else "")
+    if m:
+        try:
+            return float(m.group(1))
+        except (TypeError, ValueError):
+            return 0.0
+    return 0.0
+
+
+def _max_rerank(r: dict) -> float:
+    """Höchster reranked score_final über die Chunks dieser Lens.
+
+    Der Reranker integriert vector+symbolic+feedback+recency+cat_match — ein
+    hoher score_final bei schwachem cosine = ein cross-session-chunk den
+    Feedback/Recency hochzieht (genau was wir NICHT verlieren wollen)."""
+    best = 0.0
+    for c in (r or {}).get("results") or []:
+        try:
+            best = max(best, float(c.get("score_final", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            continue
+    return best
+
+
+def _lens_weak(r: dict) -> bool:
+    """Lens trägt keinen Kontext bei: weder semantisch (cosine) noch reranked."""
+    return (_max_sim(r) < _MIN_PROMPT_SIM_THRESHOLD
+            and _max_rerank(r) < _MIN_RERANK_SCORE)
 
 
 def _load_active_categories(token: str = "") -> list[str]:
@@ -533,22 +574,10 @@ def main() -> None:
     # die search rauschen. Lieber explizit "kein prior context" ausgeben
     # statt das LLM mit halbrelevanten chunks zu vergiften. Hard-block ist
     # falsch — Opus arbeitet weiter, nur ohne kontext-bias.
-    def _max_sim(r: dict) -> float:
-        diag = (r or {}).get("diagnostics") or {}
-        vs = diag.get("vector_stage") or ""
-        m = re.search(r"max_score=([0-9.]+)", vs if isinstance(vs, str) else "")
-        if m:
-            try:
-                return float(m.group(1))
-            except (TypeError, ValueError):
-                return 0.0
-        return 0.0
-
-    all_weak = all(
-        _max_sim(r) < _MIN_PROMPT_SIM_THRESHOLD
-        for r in (primary, results.get("ambient"), results.get("conversation"))
-        if r and "_hook_error" not in r
-    )
+    lenses = [r for r in (primary, results.get("ambient"), results.get("conversation"))
+              if r and "_hook_error" not in r]
+    all_weak = all(_lens_weak(r) for r in lenses)
+    _best_rerank = max((_max_rerank(r) for r in lenses), default=0.0)
     cat_hint = (f" · kategorien={','.join(prompt_categories)}"
                 if prompt_categories else "")
 
@@ -557,8 +586,9 @@ def main() -> None:
             pinned_prefix
             + f"## Memory: _No prior context — Thema neu_\n"
             f"_diag: {primary_diag}{cat_hint}_\n"
-            f"_max_sim<{_MIN_PROMPT_SIM_THRESHOLD} bei allen lenses — keine "
-            f"halb-relevanten chunks injiziert, damit nichts den fokus verwischt._"
+            f"_max_sim<{_MIN_PROMPT_SIM_THRESHOLD} UND reranker score_final<"
+            f"{_MIN_RERANK_SCORE} (best={_best_rerank:.2f}) bei allen lenses — "
+            f"weder semantisch noch über Feedback/Recency ein relevanter chunk._"
         )
         return
 
