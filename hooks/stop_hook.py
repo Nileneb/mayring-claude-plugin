@@ -72,6 +72,11 @@ _PATH_KEY_MIN_LEN = 5       # avoid spurious matches on tiny basenames
 # see what was injected. See memory_inject._write_inject_state.
 _INJECT_STATE_DIR = os.path.expanduser("~/.config/mayring/inject-state")
 
+# Per-session marker of the last session-goal we ingested → avoids re-POSTing an
+# unchanged /goal every turn. Advances ONLY on a successful POST, so a failed POST
+# is automatically retried next turn (the goal is still active in the transcript).
+_SESSION_GOAL_STATE = os.path.expanduser("~/.config/mayring/session-goal-state.json")
+
 # Legacy regex kept for transcripts that DO contain the block inline
 # (e.g. paste-ins, debugging). New canonical source is the state file.
 _CHUNK_LINE_RE = re.compile(r"`(chk_[a-f0-9]{16})`\s*:\s*`([^`]+)`")
@@ -596,6 +601,97 @@ def _auto_feedback(turns: list[dict], session_id: str, token: str) -> None:
     clear_inject_state(session_id)
 
 
+def latest_session_goal(transcript_path: str) -> str:
+    """Claudes natives /goal aus dem Transcript: die letzte ``goal_status``-Zeile
+    (strukturiertes Feld ``condition``, KEIN Prosa-Scraping). "" wenn kein Goal aktiv."""
+    if not transcript_path or not os.path.exists(transcript_path):
+        return ""
+    goal = ""
+    try:
+        with open(transcript_path, encoding="utf-8") as f:
+            for line in f:
+                if '"goal_status"' not in line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if row.get("type") == "goal_status":
+                    cond = (row.get("condition") or "").strip()
+                    if cond:
+                        goal = cond  # keep the latest
+    except OSError:
+        return ""
+    return goal
+
+
+def _read_goal_state() -> dict:
+    try:
+        with open(_SESSION_GOAL_STATE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_goal_state(state: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(_SESSION_GOAL_STATE), exist_ok=True)
+        with open(_SESSION_GOAL_STATE, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except OSError:
+        pass
+
+
+def capture_session_goal(payload: dict, token: str) -> None:
+    """Erfasst Claudes natives Session-`/goal` → Mayring goal-Achse (igio_axis='goal').
+
+    Das native Goal ist kein Hook-Feld; es liegt als strukturierte ``goal_status``-Zeile
+    im Transcript. Wir ingesten die aktuelle condition als goal-Chunk via /memory/put —
+    ``igio_hint='goal'`` setzt die Achse direkt (bypassed Classifier+SKIP-Gate) und nutzt
+    /memory/goals + IGIO-Lens + Injection unverändert wieder. Idempotent: source_id =
+    hash(goal); per-session-Marker verhindert Re-POST eines unveränderten Goals."""
+    import hashlib
+    import time as _t
+
+    transcript_path = payload.get("transcript_path", "")
+    session_id = payload.get("session_id", "") or "unknown"
+    goal = latest_session_goal(transcript_path)
+    if not goal:
+        return
+    ghash = hashlib.sha256(goal.encode("utf-8")).hexdigest()[:16]
+    state = _read_goal_state()
+    if state.get(session_id) == ghash:
+        return  # unverändert diese Session
+
+    body = json.dumps({
+        "content": goal,
+        "source_id": f"session_goal:{ghash}",
+        "source_type": "session_goal",
+        "igio_hint": "goal",
+    }).encode()
+    req = urllib.request.Request(
+        f"{_API_URL}/memory/put", data=body,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {token}", **device_headers()},
+        method="POST")
+    for attempt in range(2):
+        try:
+            urllib.request.urlopen(req, timeout=_TIMEOUT)
+            state[session_id] = ghash          # nur bei Erfolg → Retry-next-turn
+            _write_goal_state(state)
+            sys.stderr.write(f"[stop_hook] session-goal → goal axis: {goal[:60]!r}\n")
+            return
+        except urllib.error.HTTPError as e:
+            if e.code in (502, 503, 504) and attempt < 1:
+                _t.sleep(0.6)
+                continue
+            sys.stderr.write(f"[stop_hook] session-goal POST HTTP {e.code} (retry next turn)\n")
+            return
+        except (urllib.error.URLError, OSError) as e:
+            sys.stderr.write(f"[stop_hook] session-goal POST {type(e).__name__} (retry next turn)\n")
+            return
+
+
 def main() -> None:
     token = _read_token()
     if not token:
@@ -613,6 +709,10 @@ def main() -> None:
         _auto_feedback(turns, session_id, token)
     except Exception as exc:
         sys.stderr.write(f"[stop_hook] auto_feedback crashed: {type(exc).__name__}: {exc}\n")
+    try:
+        capture_session_goal(payload, token)
+    except Exception as exc:
+        sys.stderr.write(f"[stop_hook] capture_session_goal crashed: {type(exc).__name__}: {exc}\n")
 
 
 if __name__ == "__main__":
