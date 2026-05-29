@@ -49,9 +49,13 @@ jobs:
           fi
           if [ -z "$AUTH" ] && [ -n "$LEGACY_TOKEN" ]; then AUTH="Bearer $LEGACY_TOKEN"; fi
           if [ -z "$AUTH" ]; then echo "no auth available (no id-token perm + no legacy token)"; exit 0; fi
-          curl -sS -m 10 -X POST "$API/repo-events" \
+          AUTH_KIND=$([ -n "$OIDC" ] && echo "oidc" || echo "legacy-token")
+          CODE=$(curl -sS -m 10 -o /tmp/resp -w "%{http_code}" -X POST "$API/repo-events" \
             -H "Authorization: $AUTH" -H 'Content-Type: application/json' \
             -d "$(jq -nc --arg e "$ETYPE" --arg r "$REPO" --arg s "$SHA" --arg ref "$REF" \
                      --arg c "$CONCL" --arg w "$WF" \
                      '{event_type:$e, repo:$r, sha:$s, ref:$ref, conclusion:$c, workflow:$w}')" \
-            || echo "mayring repo-watch POST failed (non-fatal)"
+            || echo "000")
+          echo "repo-watch POST /repo-events ($AUTH_KIND) → HTTP $CODE"
+          head -c 300 /tmp/resp 2>/dev/null || true
+          # observability only — never fail the run (continue-on-error backs this up too)
