@@ -197,6 +197,84 @@ def _flatten_content(content) -> str:
     return str(content)
 
 
+_ACTION_LIMIT = 30   # max tool-action lines folded into one turn capture
+# Keys probed (in order) for the human-meaningful target of a tool call.
+_TOOL_TARGET_KEYS = ("file_path", "command", "path", "pattern", "url",
+                     "query", "description", "prompt")
+
+
+def _render_tool_use(block: dict) -> str | None:
+    """Compact one tool_use block to ``Name: target`` (e.g. ``Edit: src/foo.py``).
+
+    WHY(write-leak): the raw tool args/outputs are huge + get categorically
+    dropped server-side (conversation_filter diff-skip). A compact action line
+    captures WHAT was done without tripping that filter — and feeds the
+    recency-lane real substance instead of prose-only."""
+    name = (block.get("name") or "").strip()
+    if not name:
+        return None
+    inp = block.get("input") or {}
+    target = ""
+    if isinstance(inp, dict):
+        for k in _TOOL_TARGET_KEYS:
+            v = inp.get(k)
+            if v:
+                target = str(v)
+                break
+    target = target.replace("\n", " ").strip()[:120]
+    return f"{name}: {target}" if target else name
+
+
+def _has_text_block(content) -> bool:
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        return any(
+            isinstance(b, dict) and b.get("type") == "text" and str(b.get("text", "")).strip()
+            for b in content
+        )
+    return False
+
+
+def extract_turn_actions(transcript_path: str) -> list[str]:
+    """Tool-Aktionen (Edit/Bash/Write/…) seit dem letzten User-Prompt.
+
+    Das ist die EIGENTLICHE Arbeit eines Turns, die _flatten_content strippt.
+    Reset bei jedem neuen User-PROMPT (Text-Turn); tool_result-only-User-Turns
+    (kein Text) resetten NICHT, sonst ginge die Aktionskette pro Tool-Roundtrip
+    verloren. Gekappt auf die letzten _ACTION_LIMIT."""
+    if not transcript_path or not os.path.exists(transcript_path):
+        return []
+    actions: list[str] = []
+    try:
+        with open(transcript_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if row.get("type") not in ("user", "assistant"):
+                    continue
+                msg = row.get("message") or {}
+                role = msg.get("role") or row.get("type")
+                content = msg.get("content")
+                if role == "user" and _has_text_block(content):
+                    actions = []  # new prompt → window resets to "since last prompt"
+                    continue
+                if role == "assistant" and isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "tool_use":
+                            rendered = _render_tool_use(block)
+                            if rendered:
+                                actions.append(rendered)
+    except OSError:
+        return []
+    return actions[-_ACTION_LIMIT:]
+
+
 _IGIO_FAST_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
     (re.compile(r"\b(ziel|goal|goals|objective|objectives|wir\s+wollen|we\s+want|anstreben|vorhaben|soll\s+sein)\b", re.I), "goal"),
     (re.compile(r"\b(bug|fehler|problem|issue|broken|regression|traceback|error|exception|kaputt|falsch)\b", re.I), "issue"),
@@ -553,6 +631,17 @@ def _capture_turns(payload: dict, token: str) -> list[dict]:
     turns = extract_last_turn_pair(transcript_path)
     if len(turns) < 2:
         return turns
+    # Write-leak fix: fold the turn's tool actions into the assistant content so
+    # the conversation_summary (and the recency-lane) carries the actual WORK,
+    # not just prose. Budget so the action block always survives truncation.
+    actions = extract_turn_actions(transcript_path)
+    if actions and turns[1].get("role") == "assistant":
+        # PREPEND (not append): the server summariser truncates each turn to the
+        # first ~500 chars (_format_turns). Actions are the substance we must not
+        # lose, so they lead; prose is what gets cut if anything.
+        action_block = "## Aktionen (Tools)\n" + "\n".join(f"- {a}" for a in actions)
+        budget = max(0, _MAX_TURN_CHARS - len(action_block) - 2)
+        turns[1]["content"] = action_block + "\n\n" + turns[1].get("content", "")[:budget]
     user_text = turns[0].get("content", "")
     igio_hint = _igio_fast_hint(user_text)
     _post_micro_batch(turns, session_id, _workspace_slug(), token, igio_hint=igio_hint)
