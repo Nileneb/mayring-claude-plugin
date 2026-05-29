@@ -3,17 +3,22 @@ on:
   workflow_call:
     secrets:
       MAYRING_TOKEN:
-        required: true
+        # WHY(#1): legacy fallback only. Primary auth is GitHub OIDC (secretless) —
+        # see github_oidc.verify_github_oidc in MayringCoder. New callers don't pass it.
+        required: false
 permissions:
   contents: read
+  id-token: write
 jobs:
   notify:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - name: POST event to MayringCoder (best-effort)
+      - name: POST event to MayringCoder (best-effort, GitHub OIDC)
         continue-on-error: true
         env:
-          MAYRING_TOKEN: ${{ secrets.MAYRING_TOKEN }}
           API: ${{ vars.MAYRING_API_URL || 'https://mcp.linn.games' }}
           EV: ${{ github.event_name }}
           REPO: ${{ github.server_url }}/${{ github.repository }}
@@ -21,9 +26,9 @@ jobs:
           REF: ${{ github.ref }}
           CONCL: ${{ github.event.workflow_run.conclusion }}
           WF: ${{ github.event.workflow_run.name }}
+          LEGACY_TOKEN: ${{ secrets.MAYRING_TOKEN }}
         run: |
-          # WHY: loop guard (defense-in-depth; the caller's explicit workflow list
-          # already excludes mayring-watch so this should never fire).
+          # loop guard (the caller's explicit workflow list already excludes repo-watch)
           if [ "$EV" = "workflow_run" ] && [ "$WF" = "repo-watch" ]; then
             echo "self-run, skipping"; exit 0
           fi
@@ -32,8 +37,20 @@ jobs:
             workflow_run) ETYPE=workflow_run ;;
             *) ETYPE="$EV" ;;
           esac
+          # Prefer GitHub OIDC (secretless, owner-gated server-side). Mint a short-lived
+          # token scoped to audience mcp.linn.games. Fall back to legacy MAYRING_TOKEN
+          # only if the caller didn't grant id-token: write (transition window).
+          AUTH=""
+          if [ -n "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
+            OIDC=$(curl -sS -m 10 \
+              -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=mcp.linn.games" | jq -r '.value // empty')
+            [ -n "$OIDC" ] && AUTH="Bearer $OIDC"
+          fi
+          if [ -z "$AUTH" ] && [ -n "$LEGACY_TOKEN" ]; then AUTH="Bearer $LEGACY_TOKEN"; fi
+          if [ -z "$AUTH" ]; then echo "no auth available (no id-token perm + no legacy token)"; exit 0; fi
           curl -sS -m 10 -X POST "$API/repo-events" \
-            -H "Authorization: Bearer $MAYRING_TOKEN" -H 'Content-Type: application/json' \
+            -H "Authorization: $AUTH" -H 'Content-Type: application/json' \
             -d "$(jq -nc --arg e "$ETYPE" --arg r "$REPO" --arg s "$SHA" --arg ref "$REF" \
                      --arg c "$CONCL" --arg w "$WF" \
                      '{event_type:$e, repo:$r, sha:$s, ref:$ref, conclusion:$c, workflow:$w}')" \
