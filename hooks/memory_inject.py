@@ -143,6 +143,7 @@ def _search(
     source_type: str | None = None, char_budget: int = CHAR_BUDGET,
     category_hint: list[str] | None = None,
     project_id: str | None = None, task_context: str = "",
+    session_id: str = "",
 ) -> dict:
     """Run one /memory/search lens.
 
@@ -179,6 +180,10 @@ def _search(
         body_dict["project"] = project_id
     if task_context:
         body_dict["task_context"] = task_context
+    if session_id:
+        # Recency-Lane: macht den laufenden Session-Thread serverseitig sichtbar
+        # (retrieval._session_recency_ids) — "nie wieder out of context".
+        body_dict["session_id"] = session_id
     body = json.dumps(body_dict).encode()
     req = urllib.request.Request(
         f"{API}/memory/search",
@@ -358,7 +363,8 @@ def _categorize_prompt(prompt: str, token: str = "") -> list[str]:
 def _multi_lens_search(query: str, token: str, *,
                        category_hint: list[str] | None = None,
                        project_id: str | None = None,
-                       task_context: str = "") -> dict[str, dict]:
+                       task_context: str = "",
+                       session_id: str = "") -> dict[str, dict]:
     """Run the three lens-searches SEQUENTIALLY (primary first); one entry per lens.
 
     Each value is either a real search response or a `{_hook_error: ...}`
@@ -368,7 +374,7 @@ def _multi_lens_search(query: str, token: str, *,
     """
     lenses: dict[str, dict] = {
         "primary":      {"category_hint": category_hint, "project_id": project_id,
-                          "task_context": task_context},
+                          "task_context": task_context, "session_id": session_id},
         "ambient":      {"source_type": "ambient_snapshot", "top_k": TOP_K_LENS,
                           "char_budget": 1000, "project_id": project_id},
         "conversation": {"source_type": "conversation_summary", "top_k": TOP_K_LENS,
@@ -531,7 +537,8 @@ def main() -> None:
     pinned_prefix = proj_line + pinned_prefix
 
     results = _multi_lens_search(prompt, token, category_hint=prompt_categories or None,
-                                 project_id=project_id, task_context=task)
+                                 project_id=project_id, task_context=task,
+                                 session_id=payload.get("session_id", ""))
     primary = results.get("primary") or {}
     if "_hook_error" in primary:
         # Sonderfall: deploy-typische 5xx (502/503/504) sind transient
