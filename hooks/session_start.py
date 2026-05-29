@@ -436,10 +436,13 @@ def _drain_feedback_queue() -> None:
 
 
 def _drain_ingest_queue() -> None:
-    """Replay queued /conversation/micro-batch payloads.
+    """Replay queued ingest payloads to their tagged endpoint.
 
-    stop_hook enqueues here when the server returns 5xx after retries.
-    Same drop-on-4xx / keep-on-5xx semantics as feedback drain.
+    stop_hook (/conversation/micro-batch) and _memory_put (/memory/put)
+    enqueue here when the server returns 5xx after retries. Each entry
+    carries its own ``endpoint``; legacy entries without one default to
+    /conversation/micro-batch (back-compat). Same drop-on-4xx /
+    keep-on-5xx semantics as the feedback drain.
     """
     if not os.path.isfile(INGEST_QUEUE):
         return
@@ -472,9 +475,10 @@ def _drain_ingest_queue() -> None:
         body_json = entry.get("body")
         if not isinstance(body_json, str):
             continue
+        endpoint = entry.get("endpoint") or "/conversation/micro-batch"
         body_bytes = body_json.encode("utf-8")
         req = urllib.request.Request(
-            f"{MAYRING_API}/conversation/micro-batch",
+            f"{MAYRING_API}{endpoint}",
             data=body_bytes,
             headers={
                 "Authorization": f"Bearer {token}",

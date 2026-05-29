@@ -39,38 +39,56 @@ def test_capture_posts_goal_with_igio_hint(tmp_path):
     tp = _transcript(tmp_path, [("make IGIO reflect the session", False)])
     posted = {}
 
-    def _fake_urlopen(req, timeout=None):
-        posted["url"] = req.full_url
-        posted["body"] = json.loads(req.data.decode())
-        return MagicMock()
+    def _fake_put(content, source_id, source_type, token, *, igio_hint=None,
+                  categorize=True, enqueue=True, **_k):
+        posted.update(content=content, source_id=source_id,
+                      source_type=source_type, igio_hint=igio_hint,
+                      categorize=categorize, enqueue=enqueue)
+        return 200
 
     with patch.object(sh, "_SESSION_GOAL_STATE", str(tmp_path / "state.json")), \
-         patch.object(sh, "device_headers", lambda: {}), \
-         patch.object(sh.urllib.request, "urlopen", side_effect=_fake_urlopen):
+         patch.object(sh, "put_memory", side_effect=_fake_put):
         sh.capture_session_goal({"transcript_path": tp, "session_id": "s1"}, "jwt")
 
-    assert posted["url"].endswith("/memory/put")
-    assert posted["body"]["igio_hint"] == "goal"          # sets axis directly
-    assert posted["body"]["content"] == "make IGIO reflect the session"
-    assert posted["body"]["source_id"].startswith("session_goal:")
-    assert posted["body"]["source_type"] == "session_goal"
+    assert posted["igio_hint"] == "goal"          # sets axis directly
+    assert posted["content"] == "make IGIO reflect the session"
+    assert posted["source_id"].startswith("session_goal:")
+    assert posted["source_type"] == "session_goal"
+    assert posted["enqueue"] is False             # per-turn marker is the retry path
+    assert posted["categorize"] is False
 
 
 def test_capture_dedups_unchanged_goal(tmp_path):
     tp = _transcript(tmp_path, [("same goal", False)])
     calls = []
 
-    def _fake_urlopen(req, timeout=None):
+    def _fake_put(*a, **k):
         calls.append(1)
-        return MagicMock()
+        return 200
 
     with patch.object(sh, "_SESSION_GOAL_STATE", str(tmp_path / "state.json")), \
-         patch.object(sh, "device_headers", lambda: {}), \
-         patch.object(sh.urllib.request, "urlopen", side_effect=_fake_urlopen):
+         patch.object(sh, "put_memory", side_effect=_fake_put):
         sh.capture_session_goal({"transcript_path": tp, "session_id": "s1"}, "jwt")
         sh.capture_session_goal({"transcript_path": tp, "session_id": "s1"}, "jwt")
 
     assert len(calls) == 1  # unchanged goal → only posted once (per-session marker)
+
+
+def test_capture_no_marker_advance_on_failure(tmp_path):
+    """A failed POST (status != 200) must NOT advance the marker → retried next turn."""
+    tp = _transcript(tmp_path, [("retry me", False)])
+    calls = []
+
+    def _fake_put(*a, **k):
+        calls.append(1)
+        return 0  # 5xx/network — enqueue=False so it relies on this retry
+
+    with patch.object(sh, "_SESSION_GOAL_STATE", str(tmp_path / "state.json")), \
+         patch.object(sh, "put_memory", side_effect=_fake_put):
+        sh.capture_session_goal({"transcript_path": tp, "session_id": "s1"}, "jwt")
+        sh.capture_session_goal({"transcript_path": tp, "session_id": "s1"}, "jwt")
+
+    assert len(calls) == 2  # marker not advanced → posted again
 
 
 def test_capture_noop_without_goal(tmp_path):
@@ -78,7 +96,6 @@ def test_capture_noop_without_goal(tmp_path):
     p.write_text(json.dumps({"type": "user", "message": {"content": "x"}}) + "\n", encoding="utf-8")
     calls = []
     with patch.object(sh, "_SESSION_GOAL_STATE", str(tmp_path / "state.json")), \
-         patch.object(sh, "device_headers", lambda: {}), \
-         patch.object(sh.urllib.request, "urlopen", side_effect=lambda *a, **k: calls.append(1)):
+         patch.object(sh, "put_memory", side_effect=lambda *a, **k: calls.append(1)):
         sh.capture_session_goal({"transcript_path": str(p), "session_id": "s1"}, "jwt")
     assert not calls  # no goal_status → no POST

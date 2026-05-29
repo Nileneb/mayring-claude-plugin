@@ -47,6 +47,29 @@ except ImportError:
     def report_hook_event(*_a, **_k) -> None:  # type: ignore[misc]
         pass
 
+try:
+    from _memory_put import put_memory
+except ImportError:
+    # Standalone-snapshot fallback: single-shot POST, no retry/queue/refresh.
+    def put_memory(content, source_id, source_type, token, *, igio_hint=None,
+                   categorize=True, **_k):  # type: ignore[misc]
+        body = {"source_id": source_id, "source_type": source_type,
+                "content": content, "categorize": categorize}
+        if igio_hint:
+            body["igio_hint"] = igio_hint
+        try:
+            req = urllib.request.Request(
+                f"{_API_URL}/memory/put", data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json",
+                         "Authorization": f"Bearer {token}", **device_headers()},
+                method="POST")
+            urllib.request.urlopen(req, timeout=_TIMEOUT)
+            return 200
+        except urllib.error.HTTPError as e:
+            return e.code
+        except Exception:
+            return 0
+
 # Local fallback queue — when /memory/feedback fails after retries (deploy
 # window, network hiccup, ANY 5xx), the entry gets appended here.
 # session_start.py::_drain_feedback_queue() replays everything to REST on
@@ -649,9 +672,12 @@ def capture_session_goal(payload: dict, token: str) -> None:
     im Transcript. Wir ingesten die aktuelle condition als goal-Chunk via /memory/put —
     ``igio_hint='goal'`` setzt die Achse direkt (bypassed Classifier+SKIP-Gate) und nutzt
     /memory/goals + IGIO-Lens + Injection unverändert wieder. Idempotent: source_id =
-    hash(goal); per-session-Marker verhindert Re-POST eines unveränderten Goals."""
+    hash(goal); per-session-Marker verhindert Re-POST eines unveränderten Goals.
+
+    Läuft über den geteilten put_memory-Pfad (gleicher robuste /memory/put wie der
+    Recap). enqueue=False: der per-turn-Marker IST der Retry-Mechanismus des Goals
+    (advance nur bei 200) — Queueing würde beim nächsten Turn doppelt senden."""
     import hashlib
-    import time as _t
 
     transcript_path = payload.get("transcript_path", "")
     session_id = payload.get("session_id", "") or "unknown"
@@ -663,33 +689,14 @@ def capture_session_goal(payload: dict, token: str) -> None:
     if state.get(session_id) == ghash:
         return  # unverändert diese Session
 
-    body = json.dumps({
-        "content": goal,
-        "source_id": f"session_goal:{ghash}",
-        "source_type": "session_goal",
-        "igio_hint": "goal",
-    }).encode()
-    req = urllib.request.Request(
-        f"{_API_URL}/memory/put", data=body,
-        headers={"Content-Type": "application/json",
-                 "Authorization": f"Bearer {token}", **device_headers()},
-        method="POST")
-    for attempt in range(2):
-        try:
-            urllib.request.urlopen(req, timeout=_TIMEOUT)
-            state[session_id] = ghash          # nur bei Erfolg → Retry-next-turn
-            _write_goal_state(state)
-            sys.stderr.write(f"[stop_hook] session-goal → goal axis: {goal[:60]!r}\n")
-            return
-        except urllib.error.HTTPError as e:
-            if e.code in (502, 503, 504) and attempt < 1:
-                _t.sleep(0.6)
-                continue
-            sys.stderr.write(f"[stop_hook] session-goal POST HTTP {e.code} (retry next turn)\n")
-            return
-        except (urllib.error.URLError, OSError) as e:
-            sys.stderr.write(f"[stop_hook] session-goal POST {type(e).__name__} (retry next turn)\n")
-            return
+    status = put_memory(goal, f"session_goal:{ghash}", "session_goal", token,
+                        igio_hint="goal", categorize=False, enqueue=False)
+    if status == 200:
+        state[session_id] = ghash          # nur bei Erfolg → Retry-next-turn
+        _write_goal_state(state)
+        sys.stderr.write(f"[stop_hook] session-goal → goal axis: {goal[:60]!r}\n")
+    else:
+        sys.stderr.write(f"[stop_hook] session-goal POST status={status} (retry next turn)\n")
 
 
 def main() -> None:
