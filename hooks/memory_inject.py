@@ -365,12 +365,11 @@ def _multi_lens_search(query: str, token: str, *,
                        project_id: str | None = None,
                        task_context: str = "",
                        session_id: str = "") -> dict[str, dict]:
-    """Run the three lens-searches SEQUENTIALLY (primary first); one entry per lens.
+    """Run the three lens-searches CONCURRENTLY; one entry per lens.
 
     Each value is either a real search response or a `{_hook_error: ...}`
-    sentinel. Lenses that don't fit the GLOBAL_TIMEOUT budget keep their
-    pre-seeded sentinel. Sequential (not concurrent) because the single-worker
-    API serialises concurrent searches into timeouts — see the loop comment.
+    sentinel. Lenses that don't finish within GLOBAL_TIMEOUT keep their
+    pre-seeded sentinel.
     """
     lenses: dict[str, dict] = {
         "primary":      {"category_hint": category_hint, "project_id": project_id,
@@ -382,22 +381,28 @@ def _multi_lens_search(query: str, token: str, *,
     }
     results: dict[str, dict] = {n: {"_hook_error": "lens did not complete in time"}
                                 for n in lenses}
-    # WHY(api-saturation 2026-05-24): the cloud API is a single uvicorn worker.
-    # Firing all three lenses CONCURRENTLY made them serialise on that one worker
-    # to 16-30s and ALL three blew the 9s per-request timeout → the user got zero
-    # memory. Run them SEQUENTIALLY in priority order instead: 'primary'
-    # (insertion-first) gets the worker alone (~4s < timeout) and reliably
-    # returns; the secondary snapshot lenses consume whatever GLOBAL_TIMEOUT
-    # budget is left. Proper fix is a multi-worker API (capacity spec) — this is
-    # the interim client-side mitigation.
-    _deadline = _time.monotonic() + GLOBAL_TIMEOUT
-    for name, kwargs in lenses.items():
-        if _time.monotonic() >= _deadline:
-            break  # out of budget → keep the pre-seeded sentinel for the rest
+    # WHY(2026-05-30 lens-starvation): the lenses were made SEQUENTIAL on
+    # 2026-05-24 because the cloud API was a SINGLE uvicorn worker. It is now
+    # `--workers 4` (api-concurrency-capacity) — sized SPECIFICALLY for the 3
+    # parallel lens searches — but the hook was never switched back. Sequential +
+    # 9s/lens overran the 12s GLOBAL_TIMEOUT so ambient + conversation starved
+    # (the "lens did not complete in time" you saw every prompt). Concurrent
+    # again: all three finish in ~max(9s) and fit the budget. Bounded by
+    # as_completed(timeout=GLOBAL_TIMEOUT); unfinished lenses keep their sentinel.
+    from concurrent.futures import (ThreadPoolExecutor, as_completed,
+                                    TimeoutError as _FutureTimeout)
+    with ThreadPoolExecutor(max_workers=len(lenses)) as ex:
+        futs = {ex.submit(_search, query, token, **kw): name
+                for name, kw in lenses.items()}
         try:
-            results[name] = _search(query, token, **kwargs)
-        except Exception as exc:
-            results[name] = {"_hook_error": f"{type(exc).__name__}: {exc}"}
+            for fut in as_completed(futs, timeout=GLOBAL_TIMEOUT):
+                name = futs[fut]
+                try:
+                    results[name] = fut.result()
+                except Exception as exc:
+                    results[name] = {"_hook_error": f"{type(exc).__name__}: {exc}"}
+        except _FutureTimeout:
+            pass  # unfinished lenses keep their pre-seeded sentinel
     return results
 
 
