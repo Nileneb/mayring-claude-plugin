@@ -70,14 +70,49 @@ def _gh(args: list[str], timeout: float = 8.0) -> dict | list | None:
         return None
 
 
+def _fetch_server_watch() -> dict[str, list[str]]:
+    """Active watched repos managed via the dashboard (GET /stats/watch-repos).
+
+    Server is the source of truth for user-added repos; best-effort (network/JWT
+    failure → {} so the built-in default still applies). Returns slug → alert-types.
+    """
+    import urllib.request
+    api = os.getenv("MAYRING_API_URL", "https://mcp.linn.games").rstrip("/")
+    jwt_path = os.getenv("MAYRING_JWT_FILE", os.path.expanduser("~/.config/mayring/hook.jwt"))
+    try:
+        token = Path(jwt_path).expanduser().read_text(encoding="utf-8").strip()
+    except OSError:
+        return {}
+    if not token:
+        return {}
+    try:
+        req = urllib.request.Request(
+            f"{api}/stats/watch-repos",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urllib.request.urlopen(req, timeout=4) as resp:  # nosec B310
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return {}
+    known = set(_CHECKS)
+    out: dict[str, list[str]] = {}
+    for r in (data.get("repos") or []):
+        if r.get("active") and r.get("repo_slug"):
+            keep = [t for t in (r.get("alerts") or []) if t in known] or ["ci"]
+            out[str(r["repo_slug"])] = keep
+    return out
+
+
 def _load_watch_config() -> dict[str, list[str]]:
-    """repo-slug → list of check-types. Falls back to the built-in default."""
+    """repo-slug → check-types. Server-managed list (dashboard) UNION the built-in
+    default (so the core repos stay watched even before the server has any)."""
+    # Base: local config file if present + valid, else the built-in default.
+    base: dict[str, list[str]] = dict(_DEFAULT_WATCH)
     try:
         with open(_CONFIG_FILE) as f:
             cfg = json.load(f)
         repos = cfg.get("repos")
         if isinstance(repos, dict) and repos:
-            # normalise: each value must be a non-empty list of known types
             known = set(_CHECKS)
             out: dict[str, list[str]] = {}
             for slug, types in repos.items():
@@ -86,10 +121,13 @@ def _load_watch_config() -> dict[str, list[str]]:
                     if keep:
                         out[str(slug)] = keep
             if out:
-                return out
+                base = out
     except (OSError, json.JSONDecodeError, AttributeError):
         pass
-    return dict(_DEFAULT_WATCH)
+    # UNION the server-managed (dashboard) repos — server wins on overlap.
+    merged = dict(base)
+    merged.update(_fetch_server_watch())
+    return merged
 
 
 def _load_state() -> dict:
