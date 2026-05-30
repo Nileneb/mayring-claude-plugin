@@ -41,6 +41,12 @@ _CONFIG_FILE = Path(os.path.expanduser("~/.config/mayring/watch_repos.json"))
 _DEFAULT_WATCH: dict[str, list[str]] = {
     "Nileneb/MayringCoder": ["ci", "code_scanning", "dependabot"],
     "Nileneb/app.linn.games": ["ci", "code_scanning", "dependabot", "pulls"],
+    # WHY(2026-05-30): these were UNwatched — a red mayring-pi-agent CI sat failing
+    # on every commit for hours unnoticed (a2a-sdk missing sse-starlette extra)
+    # because the repo wasn't in this map. Watch all active repos, not just the big two.
+    "Nileneb/mayring-pi-agent": ["ci", "code_scanning", "dependabot"],
+    "Nileneb/mayring-core": ["ci", "code_scanning", "dependabot"],
+    "Nileneb/mayring-claude-plugin": ["ci", "code_scanning", "dependabot"],
 }
 
 # WHY(2026-05-11): "Automatic Dependency Submission" ist GitHubs auto-
