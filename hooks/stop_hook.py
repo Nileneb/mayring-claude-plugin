@@ -47,6 +47,27 @@ except ImportError:
     def report_hook_event(*_a, **_k) -> None:  # type: ignore[misc]
         pass
 
+# C3: read the session's resolved project (written by memory_inject's router) +
+# the cwd remote, so the micro-batch can stamp X-Project-Id + origin_ref. Best-
+# effort: any failure → no stamp (chunks stay global), never breaks the hook.
+try:
+    from _session_ctx import read_session_ctx as _read_session_ctx, _git_remote
+except ImportError:
+    def _read_session_ctx(*_a, **_k):  # type: ignore[misc]
+        return None
+
+    def _git_remote(*_a, **_k):  # type: ignore[misc]
+        return None
+
+
+def _project_stamp() -> tuple[str | None, str]:
+    """(project_id, origin_ref) for the current session, fail-soft → (None, '')."""
+    try:
+        active = (_read_session_ctx(max_age=0) or {}).get("active_project") or {}
+        return active.get("project_id"), (_git_remote() or "")
+    except Exception:
+        return None, ""
+
 try:
     from _memory_put import put_memory
 except ImportError:
@@ -300,7 +321,9 @@ def _igio_fast_hint(text: str) -> str | None:
     return None
 
 
-def _post_micro_batch(turns: list[dict], session_id: str, workspace_slug: str, token: str, igio_hint: str | None = None) -> int:
+def _post_micro_batch(turns: list[dict], session_id: str, workspace_slug: str, token: str,
+                      igio_hint: str | None = None, project_id: str | None = None,
+                      origin_ref: str = "") -> int:
     body_dict: dict = {
         "turns": turns,
         "session_id": session_id,
@@ -308,11 +331,19 @@ def _post_micro_batch(turns: list[dict], session_id: str, workspace_slug: str, t
     }
     if igio_hint:
         body_dict["igio_hint"] = igio_hint
+    # C3: stamp the session's project so the server links these conversation
+    # chunks (producer B). origin_ref = the cwd's canonical repo URL (nested-repo
+    # aware). X-Project-Id header mirrors the X-Device-Id pattern; without it the
+    # micro-batch chunks stay global (no link) — exactly the pre-C3 behaviour.
+    if origin_ref:
+        body_dict["origin_ref"] = origin_ref
+    _proj_headers = {"X-Project-Id": project_id} if project_id else {}
     payload = json.dumps(body_dict).encode()
     req = urllib.request.Request(
         f"{_API_URL}/conversation/micro-batch",
         data=payload,
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}", **device_headers()},
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}",
+                 **device_headers(), **_proj_headers},
         method="POST",
     )
     # Retry on 502/503/504 + queue on persistent failure. Same pattern
@@ -644,7 +675,9 @@ def _capture_turns(payload: dict, token: str) -> list[dict]:
         turns[1]["content"] = action_block + "\n\n" + turns[1].get("content", "")[:budget]
     user_text = turns[0].get("content", "")
     igio_hint = _igio_fast_hint(user_text)
-    _post_micro_batch(turns, session_id, _workspace_slug(), token, igio_hint=igio_hint)
+    _proj_id, _origin_ref = _project_stamp()
+    _post_micro_batch(turns, session_id, _workspace_slug(), token, igio_hint=igio_hint,
+                      project_id=_proj_id, origin_ref=_origin_ref)
     return turns
 
 

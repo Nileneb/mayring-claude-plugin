@@ -96,7 +96,7 @@ def test_capture_turns_folds_actions_into_assistant_content(tmp_path):
     ])
     posted = {}
 
-    def _fake_post(turns, session_id, slug, token, igio_hint=None):
+    def _fake_post(turns, session_id, slug, token, igio_hint=None, **_k):
         posted["turns"] = turns
         return 200
 

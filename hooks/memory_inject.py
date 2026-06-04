@@ -523,12 +523,19 @@ def main() -> None:
     # cachen, project_id + task an die Suche durchreichen.
     ctx = _read_session_ctx() or {}
     active = ctx.get("active_project")
+    _cur_remote = _git_remote()
     # Re-route bei fehlendem ODER transient gescheitertem (route-unreachable)
     # Cache — sonst friert ein Cold-Start (9s-Deploy-Window) das Routing für die
     # ganze Session auf "workspace-weit" ein.
-    if active is None or (active or {}).get("reason") == "route-unreachable":
-        active = _route_project(token, _git_remote(), prompt)
+    # C3: ZUSÄTZLICH re-routen wenn die Session mitten drin das Repo wechselt
+    # (cd in ein anderes Projekt) — der Cache trägt cwd_remote, damit project_id
+    # + das gestempelte X-Project-Id dem aktuellen Verzeichnis folgen.
+    if (active is None
+            or (active or {}).get("reason") == "route-unreachable"
+            or (active or {}).get("cwd_remote") != _cur_remote):
+        active = _route_project(token, _cur_remote, prompt)
         if (active or {}).get("reason") != "route-unreachable":
+            active["cwd_remote"] = _cur_remote
             _write_session_ctx_field("active_project", active)
     project_id = (active or {}).get("project_id")
     task = _derive_task(prompt, (active or {}).get("name") or "")
