@@ -38,16 +38,12 @@ _STATE_FILE = Path(os.path.expanduser("~/.config/mayring/ci_security_state.json"
 _CONFIG_FILE = Path(os.path.expanduser("~/.config/mayring/watch_repos.json"))
 
 # Built-in default when ~/.config/mayring/watch_repos.json is absent.
-_DEFAULT_WATCH: dict[str, list[str]] = {
-    "Nileneb/MayringCoder": ["ci", "code_scanning", "dependabot"],
-    "Nileneb/app.linn.games": ["ci", "code_scanning", "dependabot", "pulls"],
-    # WHY(2026-05-30): these were UNwatched — a red mayring-pi-agent CI sat failing
-    # on every commit for hours unnoticed (a2a-sdk missing sse-starlette extra)
-    # because the repo wasn't in this map. Watch all active repos, not just the big two.
-    "Nileneb/mayring-pi-agent": ["ci", "code_scanning", "dependabot"],
-    "Nileneb/mayring-core": ["ci", "code_scanning", "dependabot"],
-    "Nileneb/mayring-claude-plugin": ["ci", "code_scanning", "dependabot"],
-}
+# WHY(2026-06-04, pipeline-consolidation): KEINE hardcoded Repos mehr. Die Watch-Liste
+# ist jetzt ausschließlich dashboard-/server-gesteuert (GET /stats/watch-repos) bzw. per
+# lokaler ~/.config/mayring/watch_repos.json. Hardcoded Defaults pollten Repos, die der
+# User nie aktiviert hatte → Fremd-Repo-Rauschen im Prompt ("Logs in fremde Agents
+# gespült", User-Eskalation). Nur noch beobachten, was explizit aktiviert wurde.
+_DEFAULT_WATCH: dict[str, list[str]] = {}
 
 # WHY(2026-05-11): "Automatic Dependency Submission" ist GitHubs auto-
 # dependency-graph-job (kein file im repo) — läuft auf jeden push inkl.
@@ -104,9 +100,10 @@ def _fetch_server_watch() -> dict[str, list[str]]:
 
 
 def _load_watch_config() -> dict[str, list[str]]:
-    """repo-slug → check-types. Server-managed list (dashboard) UNION the built-in
-    default (so the core repos stay watched even before the server has any)."""
-    # Base: local config file if present + valid, else the built-in default.
+    """repo-slug → check-types. Fully dashboard/server-driven: the server-managed list
+    (GET /stats/watch-repos) UNION an optional local ~/.config/mayring/watch_repos.json.
+    No hardcoded defaults (see _DEFAULT_WATCH) → only explicitly-activated repos are polled."""
+    # Base: local config file if present + valid, else empty (server-driven only).
     base: dict[str, list[str]] = dict(_DEFAULT_WATCH)
     try:
         with open(_CONFIG_FILE) as f:
