@@ -209,3 +209,40 @@ def write_session_ctx_field(key: str, value) -> None:
             json.dump(ctx, f)
     except OSError:
         pass
+
+
+# --- C2: Statusline project colors (read-only cache of C1 group colors) ------
+
+PROJECT_COLORS_PATH = os.path.expanduser("~/.cache/mayring/project_colors.json")
+
+
+def refresh_project_colors(token: str, max_age: float = 300.0) -> dict | None:
+    """Cache ``{canonical_repo_ref: {color, name}}`` from GET /projects (C1's
+    group_color via LEFT JOIN) so the statusline (C2) can colour the current repo
+    WITHOUT an API call per render tick. TTL-skip when fresh; best-effort — any
+    failure leaves the existing cache untouched and returns None. The keys are the
+    canonical source_ref form that /projects already stores (github → owner/name),
+    which the statusline mirrors from the cwd's git remote."""
+    if not token:
+        return None
+    try:
+        if (time.time() - os.path.getmtime(PROJECT_COLORS_PATH)) < max_age:
+            return None  # still fresh — skip the call
+    except OSError:
+        pass  # missing/unreadable → (re)build
+    try:
+        data = _get_json(f"{_api()}/projects", token)
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    colors = {
+        p["repo"]: {"color": p.get("group_color") or "", "name": p.get("name") or ""}
+        for p in data.get("projects", [])
+        if p.get("repo")
+    }
+    try:
+        os.makedirs(os.path.dirname(PROJECT_COLORS_PATH), exist_ok=True)
+        with open(PROJECT_COLORS_PATH, "w", encoding="utf-8") as f:
+            json.dump({"projects": colors, "fetched_at": time.time()}, f)
+    except OSError:
+        pass
+    return colors

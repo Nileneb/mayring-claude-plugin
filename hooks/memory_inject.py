@@ -46,10 +46,14 @@ try:
         derive_task as _derive_task,
         read_session_ctx as _read_session_ctx,
         write_session_ctx_field as _write_session_ctx_field,
+        refresh_project_colors as _refresh_project_colors,
     )
 except ImportError:
     def _ctx_load_categories(token: str = "") -> list:  # type: ignore[misc]
         return []
+
+    def _refresh_project_colors(*_a, **_k):  # type: ignore[misc]
+        return None
 
     def _route_project(*_a, **_k) -> dict:  # type: ignore[misc]
         return {"project_id": None, "name": None, "mode": "unknown",
@@ -518,6 +522,10 @@ def main() -> None:
     # treffer in passenden kategorien hoch-gerankt werden. Bei timeout/leer
     # einfach ohne hint suchen (ungefilterter fallback).
     prompt_categories = _categorize_prompt(prompt, token)
+
+    # C2: keep the statusline colour cache fresh (TTL-skip → ~1 call / 5 min;
+    # picks up newly-created repos/groups mid-session). Best-effort, never blocks.
+    _refresh_project_colors(token)
 
     # Project Router (Slice 1): einmal pro Session routen, in session_ctx.json
     # cachen, project_id + task an die Suche durchreichen.

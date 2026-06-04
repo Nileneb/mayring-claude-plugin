@@ -56,12 +56,41 @@ except ImportError:
 # parst (die nur auf der dev-Maschine existierte).
 try:
     from _session_ctx import write_session_ctx as _write_session_ctx
+    from _session_ctx import refresh_project_colors as _refresh_project_colors
 except ImportError:
     def _write_session_ctx(*_a, **_k):  # type: ignore[misc]
         return None
 
+    def _refresh_project_colors(*_a, **_k):  # type: ignore[misc]
+        return None
+
 
 PLANS_DIR = os.path.expanduser("~/.claude/plans")
+# C2: stable on-disk path for the statusline script so ~/.claude/settings.json's
+# statusLine command target never changes across plugin updates. session_start
+# keeps it in sync from the plugin copy.
+STATUSLINE_STABLE = os.path.expanduser("~/.config/mayring/statusline.py")
+
+
+def _sync_statusline(plugin_root: str) -> None:
+    """Copy the plugin's statusline script to the stable path (best-effort)."""
+    src = os.path.join(plugin_root, "statusline", "statusline.py")
+    try:
+        with open(src, encoding="utf-8") as f:
+            content = f.read()
+        os.makedirs(os.path.dirname(STATUSLINE_STABLE), exist_ok=True)
+        # Only rewrite when changed — avoids needless disk churn each session.
+        try:
+            with open(STATUSLINE_STABLE, encoding="utf-8") as f:
+                if f.read() == content:
+                    return
+        except OSError:
+            pass
+        with open(STATUSLINE_STABLE, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.chmod(STATUSLINE_STABLE, 0o755)
+    except OSError:
+        pass
 TASK_CONTEXT_BUDGET = 800
 JWT_FILE = os.path.expanduser("~/.config/mayring/hook.jwt")
 FEEDBACK_QUEUE = os.path.expanduser("~/.config/mayring/feedback_queue.jsonl")
@@ -549,5 +578,7 @@ if __name__ == "__main__":
     _drain_ingest_queue()
     _warn_if_silent_skips_accumulated()
     _write_session_ctx(_load_token())  # Phase 2: DB-codebook → session_ctx.json
+    _sync_statusline(plugin_root)               # C2: keep stable statusline script fresh
+    _refresh_project_colors(_load_token(), max_age=0)  # C2: prime colour cache for this session
     payload = json.loads(sys.stdin.read() or "{}")
     _inject_memory(payload)
