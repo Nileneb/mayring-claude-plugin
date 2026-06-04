@@ -85,17 +85,15 @@ mcp__plugin_mayring-coder_memory-agents__pi_task(
 | Konkrete Implementierung mit Memory-Kontext | `pi_task` (free-form) | lokales Ollama, ~$0, three.linn.games GPU |
 | Find / locate / patch this bug | `pi_task` | scoped retrieval via repo_slug |
 | Test-Loop iterieren | `pi_task` | |
-| **Chunk(s) Mayring-kategorisieren (labels)** | `pi_categorize(text, task, codebook?, mode)` | gibt `{labels:[str]}` für den ganzen chunk. `task` = das Thema worauf untersucht wird (Mayring Selektionskriterium); `mode` = inductive/deductive/hybrid. Nutzt die kanonischen `prompts/mayring_{mode}.md` |
-| **Mayring-kategorisieren MIT Textbeleg pro Kategorie** | `pi_mark_categories(text, task, codebook?)` | "Textmarker" — markiert konkrete Abschnitte + ordnet jedem eine Kategorie zu MIT paraphrase-begründung. `{markings:[{span:[start,end], excerpt, category, reasoning}]}`. Nutze das wenn die Kategorie nachvollziehbar am Text hängen soll (statt nur "chunk hat label x") |
+| **Text Mayring-kategorisieren** | `pi_categorize(text, task)` | DIE EINE Methode (immer mixed, ein Codebook, domänenunabhängig): Ziel→Paraphrase→Generalisierung→Reduktion→Embedding-Match gegen ALLE Bestandskategorien. Gibt `{label, match (deductive\|dedup\|inductive), paraphrase, generalize}`. Intrinsischer Embedding-Vergleich → trifft Bestand statt Duplikate. Deckt auch den früheren „für Memory reduzieren"-Fall ab (paraphrase/generalize kommen mit). |
 | **Chunk-Relevanz zu einer Query bewerten** | `pi_judge_relevance` | ersetzt LLM-judge im stop_hook/rerank — 0..1 score pro chunk |
-| **Text für Memory-Ingest reduzieren** | `pi_summarize_for_memory` | 3-step Mayring (paraphrase→generalize→reduce) + suggested_source_id |
 | Architektur-Trajektorie einer Datei | `diff_history` | git log --follow -p → trajectory/obsolete/active |
 | Code-Review / Multi-File-Refactor | Subagent (`mayring-coder:pi-subagent` ODER general-purpose, mit Pre-Fetch!) | mehr kontext-budget |
 | Architektur-/Strategieentscheidung | Self (main session) | judgment call |
 | Sensitive Secrets | Self (kein subprocess) | |
 
 **Faustregel:** Wenn die Aufgabe in eines der spezialisierten Tools passt
-(`pi_categorize` / `pi_judge_relevance` / `pi_summarize_for_memory`), nimm
+(`pi_categorize` / `pi_judge_relevance`), nimm
 das — die fokussierten Prompts + JSON-mode geben strukturierte Outputs,
 die du direkt weiterverarbeiten kannst, ohne den Pi-Agent komplett zu
 re-instruct. Nur wenn nichts passt → `pi_task` (free-form). Nur wenn

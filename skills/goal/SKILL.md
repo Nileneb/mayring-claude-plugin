@@ -8,8 +8,12 @@ description: Extrahiert Mayring-Kategorien + IGIO-Goals aus dem aktuellen Task u
 ## Was dieser Skill tut
 
 Dieser Skill schließt die Lücke zwischen User-Prompt und IGIO/Wiki_V2-Pipeline.
-Er ruft `pi_categorize` + `pi_summarize_for_memory` auf, extrahiert die **goal**-Axis
+Er ruft `pi_categorize` (die EINE Mayring-Methode) auf, extrahiert die **goal**-Axis
 und schreibt das Ergebnis direkt in Memory — sofort sichtbar, kein Cron-Warten.
+
+`/goal` = `pi_categorize` + IGIO-Axis-Klassifikation. Es gibt EINE Kategorisierungs-
+Methode (immer mixed, ein Codebook, domänenunabhängig) — `pi_categorize` liefert
+Kategorie **und** Paraphrase/Generalisierung in einem Schritt.
 
 ## Ablauf (PFLICHT, in dieser Reihenfolge)
 
@@ -24,53 +28,47 @@ mcp__claude_ai_Memory__search_memory(
 Zeige die zurückgegebenen Chunks mit `igio_axis=goal` als geordnete Liste.
 Format: `**[Datum]** Ziel: <text>`
 
-### Schritt 2 — Aktuellen Prompt kategorisieren
+### Schritt 2 — Aktuellen Prompt kategorisieren (die EINE Methode)
 ```python
 mcp__plugin_mayring-coder_memory-agents__pi_categorize(
     text="<aktueller User-Prompt / Task-Beschreibung>",
     task="Was ist das Hauptziel dieser Session? Welche Mayring-Kategorie trifft zu?",
-    mode="hybrid",
 )
 ```
-Extrahiere aus dem Ergebnis:
-- `labels` → Mayring-Kategorien (z.B. `["api", "domain", "config"]`)
+Das Ergebnis liefert in EINEM Schritt (kein separates summarize mehr):
+- `label` → die EINE Mayring-Kategorie (embedding-gematcht: trifft Bestand statt Duplikat)
+- `match` → `deductive` (bestehende getroffen) | `dedup` | `inductive` (neu gebildet)
+- `paraphrase` → Kernaussage des Prompts
+- `generalize` → die generalisierte Kategorie-Ebene
 - Bestimme die IGIO-Axis: ist der Prompt primär ein **goal** (Anstreben), **issue** (Problem), **intervention** (Umsetzung), oder **outcome** (Ergebnis)?
 
-### Schritt 3 — Für Memory reduzieren
-```python
-mcp__plugin_mayring-coder_memory-agents__pi_summarize_for_memory(
-    text="<aktueller User-Prompt>",
-    task="IGIO-Goal aus Prompt extrahieren",
-)
-```
-Nutze `reduced` als Memory-Inhalt, `suggested_source_id` als Basis für die source_id.
-
-### Schritt 4 — Als Goal in Memory speichern
+### Schritt 3 — Als Goal in Memory speichern
+`source_id` selbst bauen: `goal:<YYYY-MM-DD>:<kurz-slug aus paraphrase>`.
 ```python
 mcp__claude_ai_Memory__ingest(
-    source="<reduced Text aus Schritt 3>",
+    source="<paraphrase aus Schritt 2>",
     source_id="goal:<YYYY-MM-DD>:<kurz-slug>",
     workspace_id="<workspace_slug>",
     metadata={
         "igio_axis": "goal",
         "igio_confidence": 0.9,
-        "category_labels": "<komma-separiert aus Schritt 2>",
+        "category_labels": "<label aus Schritt 2>",
         "session_source": "goal_skill",
     },
 )
 ```
 
-### Schritt 5 — Zusammenfassung ausgeben
+### Schritt 4 — Zusammenfassung ausgeben
 
 Zeige dem User:
 ```
 ## Ziel erfasst ✓
 
-**Mayring-Kategorien:** api, domain
+**Mayring-Kategorie:** <label> (<match>)
 **IGIO-Axis:** goal
 **Memory-ID:** goal:2026-05-15:xyz
 
-**Abgeleitet:** <reduced Text>
+**Abgeleitet:** <paraphrase>
 
 **Bestehende Workspace-Ziele:** <N>
 ```
@@ -83,5 +81,5 @@ Zeige dem User:
 
 ## Fehlerfälle
 
-- `pi_categorize` schlägt fehl → trotzdem Schritt 4 ohne `category_labels` ausführen
+- `pi_categorize` schlägt fehl → trotzdem Schritt 3 ohne `category_labels` ausführen
 - `ingest` schlägt fehl → Fehler LAUT melden, NICHT still schlucken (Pattern #3)
