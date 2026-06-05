@@ -14,8 +14,8 @@ _REPO = Path("/home/nileneb/Desktop/MayringCoder")
 _WATCHER = _REPO / "tools/conversation_watcher.py"
 _PYTHON = _REPO / ".venv/bin/python"
 _TOKEN_FILE = Path.home() / ".config/mayring/hook.jwt"
-_PID_FILE = Path.home() / ".cache/mayryngcoder/watcher.pid"
-_LOG_FILE = Path.home() / ".cache/mayryngcoder/watcher.log"
+_PID_FILE = Path.home() / ".cache/mayringcoder/watcher.pid"
+_LOG_FILE = Path.home() / ".cache/mayringcoder/watcher.log"
 
 
 def _is_running() -> bool:

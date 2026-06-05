@@ -59,7 +59,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "TaskCreate|TaskUpdate|TaskGet|TaskList|TodoWrite",
+        "matcher": "TaskCreate|TaskUpdate|TodoWrite",
         "hooks": [
           {
             "type": "command",
