@@ -1,6 +1,7 @@
-"""PostToolUse capture: mirror the agent's Task* tool calls into MayringCoder
-/tasks (idempotent via external_id) so the IGIO-Lens intervention column shows
-the real work todos. Best-effort, never blocks the tool call."""
+"""PostToolUse capture: mirror the agent's Task* + native TodoWrite tool calls into
+MayringCoder /tasks (idempotent via external_id) so the IGIO-Lens intervention column
+shows the real work todos. Best-effort, never blocks the tool call."""
+import hashlib
 import json
 import os
 import sys
@@ -9,7 +10,9 @@ import urllib.request
 
 _API = os.getenv("MAYRING_API_URL", "https://mcp.linn.games").rstrip("/")
 _JWT_FILE = os.path.expanduser("~/.config/mayring/hook.jwt")
-_TODO_TOOLS = {"TaskCreate", "TaskUpdate"}
+# TodoWrite = Claudes native Todo-Liste (= "LLM Act" im Pipeline-Diagramm). War im
+# hooks.json-Matcher, wurde hier aber gedroppt → native Todos kamen nie in die IGIO-Lens.
+_TODO_TOOLS = {"TaskCreate", "TaskUpdate", "TodoWrite"}
 _TIMEOUT = 3.0
 
 _STATUS_MAP = {
@@ -80,6 +83,26 @@ def handle(payload: dict) -> None:
         if not task_id or not mapped:
             return
         _post("PATCH", f"/tasks/by-external/{task_id}", {"status": mapped}, token)
+
+    elif tool_name == "TodoWrite":
+        # Native Todo-Liste: das ganze Array kommt bei jedem Call (replace-Semantik).
+        # external_id = stabiler Hash des content → Status-Übergänge (pending→in_progress→
+        # completed bei gleichem Text) treffen denselben Task (idempotenter Upsert + PATCH).
+        ti = payload.get("tool_input") or {}
+        for t in (ti.get("todos") or []):
+            if not isinstance(t, dict):
+                continue
+            content = (t.get("content") or "").strip()
+            if not content:
+                continue
+            ext = "todo:" + hashlib.sha1(content.encode("utf-8")).hexdigest()[:16]
+            _post("POST", "/tasks", {
+                "title": content[:200], "created_by": "agent",
+                "tags": "agent,todo", "external_id": ext,
+            }, token)
+            mapped = _STATUS_MAP.get((t.get("status") or "").strip())
+            if mapped and mapped != "open":
+                _post("PATCH", f"/tasks/by-external/{ext}", {"status": mapped}, token)
 
 
 def main() -> None:

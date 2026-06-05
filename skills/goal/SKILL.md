@@ -8,8 +8,9 @@ description: Extrahiert Mayring-Kategorien + IGIO-Goals aus dem aktuellen Task u
 ## Was dieser Skill tut
 
 Dieser Skill schließt die Lücke zwischen User-Prompt und IGIO/Wiki_V2-Pipeline.
-Er ruft `pi_categorize` (die EINE Mayring-Methode) auf, extrahiert die **goal**-Axis
-und schreibt das Ergebnis direkt in Memory — sofort sichtbar, kein Cron-Warten.
+Er ruft `pi_categorize` (die EINE Mayring-Methode) auf, bestimmt die IGIO-Axis und
+routet das Ergebnis je nach Achse: **goal** → Memory; **intervention** → Claudes native
+Todo-Liste (`TodoWrite` = „LLM Act"). Sofort sichtbar, kein Cron-Warten.
 
 `/goal` = `pi_categorize` + IGIO-Axis-Klassifikation. Es gibt EINE Kategorisierungs-
 Methode (immer mixed, ein Codebook, domänenunabhängig) — `pi_categorize` liefert
@@ -58,15 +59,33 @@ mcp__claude_ai_Memory__ingest(
 )
 ```
 
+### Schritt 3.5 — Intervention → native Todo-Liste (NUR wenn IGIO-Axis = intervention)
+
+Wenn die IGIO-Axis aus Schritt 2 **intervention** ist (der Prompt ist Umsetzung/konkrete
+Arbeit, nicht bloß ein Ziel/Problem), zerlege die Intervention in konkrete Schritte und
+schreibe sie auf Claudes **native Todo-Liste** via `TodoWrite` — das ist das „LLM Act"
+des Pipeline-Loops:
+```python
+TodoWrite(todos=[
+    {"content": "<konkreter Schritt 1>", "status": "pending", "activeForm": "<-ing Form>"},
+    {"content": "<konkreter Schritt 2>", "status": "pending", "activeForm": "<-ing Form>"},
+])
+```
+Der `task_capture`-PostToolUse-Hook spiegelt diese native Todos automatisch nach
+MayringCoder `/tasks` (idempotent) → sie erscheinen in der IGIO-Lens-intervention-Spalte.
+Du musst NICHTS extra posten — nur `TodoWrite` aufrufen. (goal-Axis → Memory in Schritt 3;
+intervention-Axis → native Todos hier. Beide Achsen können zutreffen.)
+
 ### Schritt 4 — Zusammenfassung ausgeben
 
 Zeige dem User:
 ```
-## Ziel erfasst ✓
+## Erfasst ✓
 
 **Mayring-Kategorie:** <label> (<match>)
-**IGIO-Axis:** goal
-**Memory-ID:** goal:2026-05-15:xyz
+**IGIO-Axis:** goal | intervention
+**Memory-ID:** goal:2026-05-15:xyz      (bei goal-Axis)
+**Native Todos:** <N angelegt>          (bei intervention-Axis)
 
 **Abgeleitet:** <paraphrase>
 
