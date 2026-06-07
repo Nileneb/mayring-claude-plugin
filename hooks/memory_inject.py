@@ -172,8 +172,12 @@ def _search(
         # Stop-Hook-Feedback. Server macht jetzt EINEN gebatchten Call; Modell
         # = mistral:7b-instruct (non-thinking, ~0.5s warm, = Stop-Hook-Judge).
         "llm_prefilter": True,
+        # WHY(VRAM-thrashing fix 2026-06-07): advisor runs on the user's own GPU via the
+        # distilled qwen3.5-mayring:2b (≈ mistral:7b quality, ~2GB) — NOT mistral:7b (5GB),
+        # which thrashed the GPU host's VRAM against bge-m3 and cold-loaded 5-17s per call,
+        # blowing this hook's 9s budget. mistral stays cloud-only.
         "llm_prefilter_model": os.environ.get(
-            "MAYRING_LLM_ADVISOR_MODEL", "mistral:7b-instruct",
+            "MAYRING_LLM_ADVISOR_MODEL", "qwen3.5-mayring:2b",
         ),
     }
     if source_type:
@@ -239,7 +243,10 @@ def _search(
 
 
 _CATEGORIZE_OLLAMA = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
-_CATEGORIZE_MODEL = os.environ.get("MAYRING_PROMPT_CATEGORIZE_MODEL", "mistral:7b-instruct")
+# WHY(VRAM-thrashing fix 2026-06-07): prompt-categorize runs locally on qwen3.5-mayring:2b
+# (distilled ≈ mistral:7b), not mistral:7b — keeps the local GPU hot path to bge-m3 + one
+# small generate model so neither cold-loads and blows the hook's 4s categorize budget.
+_CATEGORIZE_MODEL = os.environ.get("MAYRING_PROMPT_CATEGORIZE_MODEL", "qwen3.5-mayring:2b")
 _CATEGORIZE_TIMEOUT = float(os.environ.get("MAYRING_PROMPT_CATEGORIZE_TIMEOUT", "4"))
 # WHY(2026-05-10 multi-category-prompt): cache categories pro repo-profile in
 # memory zum prompt-categorize-call. List wird einmal pro hook-process geladen.
