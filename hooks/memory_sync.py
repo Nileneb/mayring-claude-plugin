@@ -29,8 +29,14 @@ except ImportError:
         return {}
 _DEFAULT_CHROMA = os.path.expanduser("~/.cache/mayringcoder/chroma")
 _DEFAULT_WS = os.environ.get("MAYRING_WORKSPACE_ID", "default")
-_OLLAMA_URL = os.environ.get("OLLAMA_URL", "https://three.linn.games")
-_EMBED_MODEL = "nomic-embed-text"
+# WHY(LAN-cutover): three.linn.games ist Legacy/offline — der Hook läuft lokal,
+# also default localhost:11434 (eigene GPU). Nur _local_embed nutzt das (Fallback,
+# wenn ein Cloud-Chunk kein Embedding mitbringt).
+_OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+# WHY(bge-m3-migration): NICHT mehr hardcoded nomic (768d). Der Store ist auf bge-m3
+# (1024d) migriert; lokal re-embeddete Chunks MÜSSEN dieselbe Dimension wie die
+# Cloud-Embeddings haben, sonst sprengt der Upsert die lokale Collection.
+_EMBED_MODEL = os.environ.get("MAYRING_EMBED_MODEL") or os.environ.get("EMBEDDING_MODEL") or "bge-m3"
 _BATCH_SIZE = 200
 _TIMEOUT = 30
 
@@ -131,7 +137,22 @@ def _upsert_chroma(chroma_path: str, chunks_with_embeddings: list[dict]) -> None
         })
 
     if ids:
-        col.upsert(ids=ids, embeddings=embeddings, documents=documents, metadatas=metadatas)
+        try:
+            col.upsert(ids=ids, embeddings=embeddings, documents=documents, metadatas=metadatas)
+        except Exception as exc:
+            # WHY(bge-m3-migration): the local "memory_chunks" collection was created at
+            # the old nomic dim (768); the cloud now serves bge-m3 (1024) embeddings →
+            # "Collection expecting embedding with dimension of 768, got 1024" crashed
+            # the UserPromptSubmit hook on every prompt. The local Chroma is a rebuildable
+            # cache, so on a dimension mismatch drop + recreate the collection and retry
+            # once. Self-heals any future embedding-model/dim change. Re-raise anything else.
+            if "dimension" not in str(exc).lower():
+                raise
+            print(f"memory_sync: local Chroma dim mismatch ({exc}); recreating collection",
+                  file=sys.stderr)
+            client.delete_collection("memory_chunks")
+            col = client.get_or_create_collection("memory_chunks")
+            col.upsert(ids=ids, embeddings=embeddings, documents=documents, metadatas=metadatas)
 
     inactive = [c["chunk_id"] for c in chunks_with_embeddings if not c["is_active"]]
     if inactive:
