@@ -163,23 +163,19 @@ def _search(
         "char_budget": char_budget,
         # WHY(v2-llm-advisor-on): User-Auftrag — "GIBT ES EINEN GUTEN GRUND,
         # EINEN LLM ADVISOR FÜR DUMME AI ZU HABEN??? ICH SAGE JA". Der Advisor
-        # kennt die User-Regeln (KISS, no-legacy, no-silent) aus den
-        # always-injected pinned sources und nutzt sie als task_context.
-        # WHY(inject-timeout 2026-05-24): das vorherige qwen3.5:2b war ein
-        # THINKING-Modell — server-seitig 20 sequenzielle Calls × num_predict=8,
-        # </think> nie geschlossen → leere Antwort (Advisor inert) + ~12.5s/search
-        # → JEDER inject lief ins 9s-Timeout → 0 Chunks → kein Recall + kein
-        # Stop-Hook-Feedback. Server macht jetzt EINEN gebatchten Call; Modell
-        # = mistral:7b-instruct (non-thinking, ~0.5s warm, = Stop-Hook-Judge).
+        # kennt die User-Regeln aus den pinned sources und nutzt sie als task_context.
         "llm_prefilter": True,
-        # WHY(VRAM-thrashing fix 2026-06-07): advisor runs on the user's own GPU via the
-        # distilled qwen3.5-mayring:2b (≈ mistral:7b quality, ~2GB) — NOT mistral:7b (5GB),
-        # which thrashed the GPU host's VRAM against bge-m3 and cold-loaded 5-17s per call,
-        # blowing this hook's 9s budget. mistral stays cloud-only.
-        "llm_prefilter_model": os.environ.get(
-            "MAYRING_LLM_ADVISOR_MODEL", "qwen3.5-mayring:2b",
-        ),
+        # WHY(no-hardcoded-model 2026-06-08): the hook does NOT pin an advisor model.
+        # Per CLAUDE.md models come from the server ModelRouter (text_model.txt →
+        # config/model_routes.yaml), never hardcoded in a client. Hardcoding it here
+        # (it was qwen3.5-mayring:2b) overrode the router and forced a local→cloud
+        # fallback (ReadTimeout → /memory/search 500). Omit it → the server picks the
+        # text model AND applies its think=False + cloud_primary=False handling. Only an
+        # explicit MAYRING_LLM_ADVISOR_MODEL env override is forwarded (escape hatch).
     }
+    _adv_model = os.environ.get("MAYRING_LLM_ADVISOR_MODEL", "").strip()
+    if _adv_model:
+        body_dict["llm_prefilter_model"] = _adv_model
     if source_type:
         body_dict["source_type"] = source_type
     if category_hint:
@@ -243,10 +239,10 @@ def _search(
 
 
 _CATEGORIZE_OLLAMA = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
-# WHY(VRAM-thrashing fix 2026-06-07): prompt-categorize runs locally on qwen3.5-mayring:2b
-# (distilled ≈ mistral:7b), not mistral:7b — keeps the local GPU hot path to bge-m3 + one
-# small generate model so neither cold-loads and blows the hook's 4s categorize budget.
-_CATEGORIZE_MODEL = os.environ.get("MAYRING_PROMPT_CATEGORIZE_MODEL", "qwen3.5-mayring:2b")
+# WHY(no-hardcoded-model 2026-06-08): empty = let the server ModelRouter pick the text
+# model (per CLAUDE.md; was hardcoded qwen3.5-mayring:2b). Only an explicit env override
+# is forwarded to /pi/run; otherwise the model field is omitted and the server decides.
+_CATEGORIZE_MODEL = os.environ.get("MAYRING_PROMPT_CATEGORIZE_MODEL", "").strip()
 _CATEGORIZE_TIMEOUT = float(os.environ.get("MAYRING_PROMPT_CATEGORIZE_TIMEOUT", "4"))
 # WHY(2026-05-10 multi-category-prompt): cache categories pro repo-profile in
 # memory zum prompt-categorize-call. List wird einmal pro hook-process geladen.
@@ -336,12 +332,14 @@ def _categorize_prompt(prompt: str, token: str = "") -> list[str]:
     # WHY(2026-05-28): route through the central /pi/run queue endpoint instead
     # of POSTing Ollama directly — ALL llama jobs go through one place so they
     # can be distributed/throttled. Fail-soft: queue slow/down → unfiltered.
-    body = json.dumps({
+    _body_dict = {
         "prompt": prompt_text,
         "kind": "categorize",
-        "model": _CATEGORIZE_MODEL,
         "timeout": _CATEGORIZE_TIMEOUT,
-    }).encode()
+    }
+    if _CATEGORIZE_MODEL:  # only forward an explicit env override; else server router decides
+        _body_dict["model"] = _CATEGORIZE_MODEL
+    body = json.dumps(_body_dict).encode()
     req = urllib.request.Request(
         f"{API}/pi/run",
         data=body,
