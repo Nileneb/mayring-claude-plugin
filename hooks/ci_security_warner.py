@@ -152,9 +152,13 @@ def _seen(state: dict, key: str, repo: str) -> list:
 # Individual checks — each returns warning lines (and mutates `state`)
 # --------------------------------------------------------------------------
 
-def _check_ci(repo: str, state: dict) -> list[str]:
+def _check_ci(repo: str, state: dict, events: list[dict]) -> list[str]:
     """New CI failures since last check (limit 30 — active repos burn through
-    a smaller window before the hook sees them)."""
+    a smaller window before the hook sees them).
+
+    CI is NOT pushed to the server here: the GitHub-Action → /repo-events pipeline
+    already records repo_ci in hook_events. This check stays in-prompt only (live
+    view); `events` is accepted for a uniform check signature but left untouched."""
     runs = _gh(["run", "list", "--repo", repo, "--limit", "30",
                 "--json", "databaseId,name,conclusion,status,event"])
     if not runs:
@@ -177,8 +181,11 @@ def _check_ci(repo: str, state: dict) -> list[str]:
     return warnings
 
 
-def _check_security(repo: str, state: dict) -> list[str]:
-    """New open code-scanning (CodeQL) alerts since last check."""
+def _check_security(repo: str, state: dict, events: list[dict]) -> list[str]:
+    """New open code-scanning (CodeQL) alerts since last check.
+
+    Like CI, not pushed here — code_scanning_alert reaches the server via the
+    GitHub-Action webhook → /repo-events (repo_security). In-prompt live view only."""
     alerts = _gh(["api", f"repos/{repo}/code-scanning/alerts?state=open",
                   "--jq", "[.[] | {n:.number, rule:.rule.id, severity:.rule.severity}]"])
     if alerts is None:
@@ -194,11 +201,11 @@ def _check_security(repo: str, state: dict) -> list[str]:
             + ", ".join(f"#{n}({s})" for n, s in sev.items())]
 
 
-def _check_dependabot(repo: str, state: dict) -> list[str]:
+def _check_dependabot(repo: str, state: dict, events: list[dict]) -> list[str]:
     """New open Dependabot alerts (vulnerable deps) since last check."""
     alerts = _gh(["api", f"repos/{repo}/dependabot/alerts?state=open&per_page=100",
                   "--jq", "[.[] | {n:.number, pkg:.dependency.package.name, "
-                          "sev:.security_advisory.severity}]"])
+                          "sev:.security_advisory.severity, url:.html_url}]"])
     if alerts is None:
         return []
     cur = sorted(a.get("n") for a in alerts if a.get("n") is not None)
@@ -209,15 +216,23 @@ def _check_dependabot(repo: str, state: dict) -> list[str]:
         return []
     by_n = {a["n"]: a for a in alerts}
     parts = [f"#{n} {by_n.get(n, {}).get('pkg', '?')}({by_n.get(n, {}).get('sev', '?')})" for n in new]
+    for n in new:
+        a = by_n.get(n, {})
+        events.append({
+            "hook_type": "repo_dependabot", "repo": repo, "number": n,
+            "severity": a.get("sev"),
+            "summary": f"{a.get('pkg', '?')} ({a.get('sev', '?')})",
+            "url": a.get("url") or f"https://github.com/{repo}/security/dependabot",
+        })
     return [f"- **{repo} Dependabot**: {len(new)} NEUE alert(s): {', '.join(parts)} "
             f"→ https://github.com/{repo}/security/dependabot"]
 
 
-def _check_pulls(repo: str, state: dict) -> list[str]:
+def _check_pulls(repo: str, state: dict, events: list[dict]) -> list[str]:
     """New open PRs since last check (so a freshly-opened PR — e.g. a
     Dependabot bump or a Copilot fix — surfaces without you having to look)."""
     prs = _gh(["pr", "list", "--repo", repo, "--state", "open", "--limit", "40",
-               "--json", "number,title,isDraft,author"])
+               "--json", "number,title,isDraft,author,url"])
     if prs is None:
         return []
     seen = _seen(state, "open_prs", repo)
@@ -231,14 +246,19 @@ def _check_pulls(repo: str, state: dict) -> list[str]:
         draft = " (draft)" if p.get("isDraft") else ""
         author = (p.get("author") or {}).get("login", "?")
         parts.append(f"#{p.get('number')} \"{str(p.get('title', ''))[:60]}\" [{author}]{draft}")
+        events.append({
+            "hook_type": "repo_pull", "repo": repo, "number": p.get("number"),
+            "summary": f"{str(p.get('title', ''))[:120]} [{author}]{draft}",
+            "url": p.get("url") or "",
+        })
     return [f"- **{repo} PRs**: {len(new)} neue open PR(s): " + " · ".join(parts)]
 
 
-def _check_issues(repo: str, state: dict) -> list[str]:
+def _check_issues(repo: str, state: dict, events: list[dict]) -> list[str]:
     """New issues assigned to you since last check (off by default — add
     "issues" to a repo's watch-list to enable)."""
     issues = _gh(["issue", "list", "--repo", repo, "--state", "open",
-                  "--assignee", "@me", "--limit", "40", "--json", "number,title"])
+                  "--assignee", "@me", "--limit", "40", "--json", "number,title,url"])
     if issues is None:
         return []
     seen = _seen(state, "assigned_issues", repo)
@@ -247,6 +267,11 @@ def _check_issues(repo: str, state: dict) -> list[str]:
     if not new:
         return []
     parts = [f"#{i.get('number')} \"{str(i.get('title', ''))[:60]}\"" for i in new]
+    for i in new:
+        events.append({
+            "hook_type": "repo_issue", "repo": repo, "number": i.get("number"),
+            "summary": str(i.get("title", ""))[:120], "url": i.get("url") or "",
+        })
     return [f"- **{repo} Issues** (assigned): {len(new)} neu: " + " · ".join(parts)]
 
 
@@ -259,10 +284,43 @@ _CHECKS = {
 }
 
 
+def _post_notifications(events: list[dict]) -> None:
+    """Hook-A: persist net-new findings (dependabot/pull/issue) to the server so they
+    surface in the Ampel dashboard (POST /stats/notifications/ingest). Best-effort:
+    no JWT, server down, or pre-deploy 404 → silent skip (the in-prompt warning is the
+    live view regardless). ci/security are NOT here — the GitHub-Action pipeline records
+    those already, so re-POSTing would duplicate them."""
+    if not events:
+        return
+    import urllib.request
+    api = os.getenv("MAYRING_API_URL", "https://mcp.linn.games").rstrip("/")
+    jwt_path = os.getenv("MAYRING_JWT_FILE", os.path.expanduser("~/.config/mayring/hook.jwt"))
+    try:
+        token = Path(jwt_path).expanduser().read_text(encoding="utf-8").strip()
+    except OSError:
+        return
+    if not token:
+        return
+    body = json.dumps({"events": events}).encode()
+    req = urllib.request.Request(
+        f"{api}/stats/notifications/ingest", data=body,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=4)  # nosec B310
+    except Exception:
+        # Best-effort: the local state-cache already advanced, so a missed POST is
+        # acceptable (next genuinely-new finding re-POSTs). Loud failure would spam
+        # every prompt during a deploy window.
+        pass
+
+
 def main() -> int:
     watch = _load_watch_config()
     state = _load_state()
     warnings: list[str] = []
+    events: list[dict] = []  # Hook-A: net-new findings to persist server-side
 
     for repo, types in watch.items():
         for t in types:
@@ -270,13 +328,14 @@ def main() -> int:
             if fn is None:
                 continue
             try:
-                warnings.extend(fn(repo, state))
+                warnings.extend(fn(repo, state, events))
             except Exception:
                 # one flaky check must not kill the whole hook — but DON'T
                 # swallow silently: surface it so a broken check is visible.
                 warnings.append(f"- **{repo} {t}**: watch-check raised (see hook) — investigate")
 
     _save_state(state)
+    _post_notifications(events)
 
     if warnings:
         print("## ⚠️ Repo-Watch (neu seit letztem prompt)\n")

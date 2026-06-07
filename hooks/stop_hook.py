@@ -323,7 +323,7 @@ def _igio_fast_hint(text: str) -> str | None:
 
 def _post_micro_batch(turns: list[dict], session_id: str, workspace_slug: str, token: str,
                       igio_hint: str | None = None, project_id: str | None = None,
-                      origin_ref: str = "") -> int:
+                      origin_ref: str = "", task: str = "") -> int:
     body_dict: dict = {
         "turns": turns,
         "session_id": session_id,
@@ -331,6 +331,11 @@ def _post_micro_batch(turns: list[dict], session_id: str, workspace_slug: str, t
     }
     if igio_hint:
         body_dict["igio_hint"] = igio_hint
+    # B.2 (goal→category): thread the active session-/goal as the categorize task so the
+    # server anchors this conversation's inductive categories to the canonical goal
+    # (core B.1 upsert_canonical_goal). Empty = unchanged (categories stay goal-less).
+    if task:
+        body_dict["task"] = task
     # C3: stamp the session's project so the server links these conversation
     # chunks (producer B). origin_ref = the cwd's canonical repo URL (nested-repo
     # aware). X-Project-Id header mirrors the X-Device-Id pattern; without it the
@@ -676,8 +681,11 @@ def _capture_turns(payload: dict, token: str) -> list[dict]:
     user_text = turns[0].get("content", "")
     igio_hint = _igio_fast_hint(user_text)
     _proj_id, _origin_ref = _project_stamp()
+    # B.2: the native session-/goal (same source as capture_session_goal) becomes the
+    # categorize task so the conversation's categories are anchored to the canonical goal.
+    goal = latest_session_goal(transcript_path)
     _post_micro_batch(turns, session_id, _workspace_slug(), token, igio_hint=igio_hint,
-                      project_id=_proj_id, origin_ref=_origin_ref)
+                      project_id=_proj_id, origin_ref=_origin_ref, task=goal)
     return turns
 
 
