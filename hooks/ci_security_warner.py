@@ -298,26 +298,35 @@ def _standing_ci(repo: str, state: dict) -> tuple[list[str], int]:
     it goes green. We track a per-workflow red-streak so a lingering failure gets
     louder, not quieter. Returns (lines, max_streak)."""
     runs = _gh(["run", "list", "--repo", repo, "--limit", "40",
-                "--json", "databaseId,name,conclusion,status,event,headBranch"])
+                "--json", "databaseId,name,workflowName,workflowDatabaseId,"
+                          "conclusion,status,event,headBranch"])
     streaks = state.setdefault("red_streak", {}).setdefault(repo, {})
     if runs is None:
         return [], 0
+    # WHY(stale-red-after-rename 2026-06-08): key the "latest run per workflow" by the
+    # STABLE workflowDatabaseId, NOT the per-run display name. When a workflow gains a
+    # `name:` field its runs' display name flips (path → name); keyed by name the old
+    # path-named failures get their OWN bucket that no later success ever supersedes →
+    # a workflow that is green for hours still shows ROT forever (OlD-mcp build-image).
+    # gh normalises workflowName to the current name even on old runs, so it is a safe
+    # display label; the id is the identity.
     latest_per_wf: dict[str, dict] = {}
-    for r in runs:  # gh returns newest-first → first seen per name is the latest
+    for r in runs:  # gh returns newest-first → first seen per workflow id is the latest
         if r.get("status") != "completed":
             continue
-        nm = str(r.get("name", ""))
-        if nm not in latest_per_wf:
-            latest_per_wf[nm] = r
+        key = str(r.get("workflowDatabaseId") or r.get("name", ""))
+        if key not in latest_per_wf:
+            latest_per_wf[key] = r
     lines: list[str] = []
     max_streak = 0
     still_red: dict[str, int] = {}
-    for nm, r in latest_per_wf.items():
+    for key, r in latest_per_wf.items():
+        nm = str(r.get("workflowName") or r.get("name", ""))
         if any(sub in nm.lower() for sub in _IGNORE_WORKFLOW_SUBSTRINGS):
             continue
         if r.get("conclusion") == "failure":
-            streak = int(streaks.get(nm, 0)) + 1
-            still_red[nm] = streak
+            streak = int(streaks.get(key, 0)) + 1
+            still_red[key] = streak
             max_streak = max(max_streak, streak)
             since = f" — seit {streak} prompt(s) ROT" if streak > 1 else ""
             lines.append(f"- 🔴 **{repo} CI**: `{nm}` ist aktuell ROT "
