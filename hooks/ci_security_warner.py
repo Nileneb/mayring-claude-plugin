@@ -283,6 +283,67 @@ _CHECKS = {
     "issues": _check_issues,
 }
 
+# Escalate to a loud, blocking directive once a failure has stood this many
+# consecutive prompts unresolved.
+_ESCALATE_AFTER = 3
+
+
+def _standing_ci(repo: str, state: dict) -> tuple[list[str], int]:
+    """Currently-red CI: the LATEST completed run per workflow that ended in failure.
+
+    WHY(false-positive-blindness 2026-06-08): the old _check_ci surfaced each failed
+    run id exactly ONCE (state-cache de-dup) then went silent — so a workflow that
+    stays red prompt after prompt vanished from view after its first appearance, and
+    a persistent outage looked resolved. A standing failure must STAY surfaced until
+    it goes green. We track a per-workflow red-streak so a lingering failure gets
+    louder, not quieter. Returns (lines, max_streak)."""
+    runs = _gh(["run", "list", "--repo", repo, "--limit", "40",
+                "--json", "databaseId,name,conclusion,status,event,headBranch"])
+    streaks = state.setdefault("red_streak", {}).setdefault(repo, {})
+    if runs is None:
+        return [], 0
+    latest_per_wf: dict[str, dict] = {}
+    for r in runs:  # gh returns newest-first → first seen per name is the latest
+        if r.get("status") != "completed":
+            continue
+        nm = str(r.get("name", ""))
+        if nm not in latest_per_wf:
+            latest_per_wf[nm] = r
+    lines: list[str] = []
+    max_streak = 0
+    still_red: dict[str, int] = {}
+    for nm, r in latest_per_wf.items():
+        if any(sub in nm.lower() for sub in _IGNORE_WORKFLOW_SUBSTRINGS):
+            continue
+        if r.get("conclusion") == "failure":
+            streak = int(streaks.get(nm, 0)) + 1
+            still_red[nm] = streak
+            max_streak = max(max_streak, streak)
+            since = f" — seit {streak} prompt(s) ROT" if streak > 1 else ""
+            lines.append(f"- 🔴 **{repo} CI**: `{nm}` ist aktuell ROT "
+                         f"(run {r.get('databaseId')}, {r.get('event')}){since}")
+    # red_streak = exactly the currently-red set (greens drop out → streak resets)
+    state["red_streak"][repo] = still_red
+    return lines, max_streak
+
+
+def _standing_smoke_issues(repo: str, state: dict) -> tuple[list[str], int]:
+    """Open `smoke-failure` issues filed by the post-deploy smoke. These persist
+    until closed (the smoke auto-closes them when prod is green), so surfacing the
+    open count every prompt is the right standing signal — not a one-shot 'new'."""
+    issues = _gh(["issue", "list", "--repo", repo, "--label", "smoke-failure",
+                  "--state", "open", "--limit", "30", "--json", "number,title"])
+    if not issues:
+        state.setdefault("smoke_open_streak", {})[repo] = 0
+        return [], 0
+    streak = int(state.setdefault("smoke_open_streak", {}).get(repo, 0)) + 1
+    state["smoke_open_streak"][repo] = streak
+    newest = max(issues, key=lambda i: int(i.get("number") or 0))
+    since = f" — seit {streak} prompt(s) offen" if streak > 1 else ""
+    return ([f"- 🔴 **{repo} Smoke**: {len(issues)} offene `smoke-failure`-Issue(s){since}; "
+             f"neuste #{newest.get('number')} \"{str(newest.get('title',''))[:70]}\""],
+            streak)
+
 
 def _post_notifications(events: list[dict]) -> None:
     """Hook-A: persist net-new findings (dependabot/pull/issue) to the server so they
@@ -322,6 +383,9 @@ def main() -> int:
     warnings: list[str] = []
     events: list[dict] = []  # Hook-A: net-new findings to persist server-side
 
+    standing: list[str] = []  # currently-red state — surfaced EVERY prompt until green
+    max_streak = 0
+
     for repo, types in watch.items():
         for t in types:
             fn = _CHECKS.get(t)
@@ -333,9 +397,35 @@ def main() -> int:
                 # one flaky check must not kill the whole hook — but DON'T
                 # swallow silently: surface it so a broken check is visible.
                 warnings.append(f"- **{repo} {t}**: watch-check raised (see hook) — investigate")
+        # Standing red-state checks run for every watched repo that watches CI —
+        # independent of the net-new state-cache so a persistent failure never
+        # silently drops out of view.
+        if "ci" in types:
+            try:
+                ci_lines, ci_streak = _standing_ci(repo, state)
+                standing.extend(ci_lines)
+                max_streak = max(max_streak, ci_streak)
+            except Exception:
+                standing.append(f"- **{repo} CI**: standing-check raised — investigate")
+            try:
+                sm_lines, sm_streak = _standing_smoke_issues(repo, state)
+                standing.extend(sm_lines)
+                max_streak = max(max_streak, sm_streak)
+            except Exception:
+                standing.append(f"- **{repo} Smoke**: standing-check raised — investigate")
 
     _save_state(state)
     _post_notifications(events)
+
+    if standing:
+        if max_streak >= _ESCALATE_AFTER:
+            print(f"## 🚨🚨 PROD ROT seit {max_streak} PROMPTS — JETZT FIXEN, "
+                  "nicht weiterarbeiten\n")
+        else:
+            print("## 🔴 Prod-Status ROT (steht bis grün)\n")
+        for s in standing:
+            print(s)
+        print("")
 
     if warnings:
         print("## ⚠️ Repo-Watch (neu seit letztem prompt)\n")
