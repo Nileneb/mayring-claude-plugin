@@ -265,17 +265,18 @@ def _latest_plan_context() -> str:
         return ""
 
 
-def _fetch_goals(api: str, token: str, top_k: int = 5) -> list[dict]:
-    """GET /memory/goals — returns goal-axis chunks for the workspace."""
+def _fetch_open_tasks(api: str, token: str, top_k: int = 5) -> list[dict]:
+    """GET /tasks?status=open — returns non-completed tasks for the workspace."""
     req = urllib.request.Request(
-        f"{api}/memory/goals?top_k={top_k}",
+        f"{api}/tasks?status=open",
         headers={"Authorization": f"Bearer {token}"},
         method="GET",
     )
     try:
         with urllib.request.urlopen(req, timeout=6) as resp:
             data = json.loads(resp.read())
-        return data.get("goals", [])
+        tasks = data.get("tasks", [])
+        return [t for t in tasks if (t.get("status") or "") != "completed"][:top_k]
     except Exception:
         return []
 
@@ -319,20 +320,21 @@ def _inject_memory(payload: dict) -> None:
     except Exception:
         pass
 
-    goals = _fetch_goals(api, token)
-    goals_block = ""
-    if goals:
+    tasks = _fetch_open_tasks(api, token)
+    tasks_block = ""
+    if tasks:
         lines = []
-        for g in goals[:5]:
-            text = (g.get("text") or "").strip()
-            if text:
-                lines.append(f"- {text[:200]}")
+        for t in tasks:
+            title = (t.get("title") or t.get("content") or "").strip()
+            status = (t.get("status") or "pending").strip()
+            if title:
+                lines.append(f"- [{status}] {title[:200]}")
         if lines:
-            goals_block = "## Laufende Workspace-Ziele\n\n" + "\n".join(lines) + "\n\n"
+            tasks_block = "## Offene Tasks\n\n" + "\n".join(lines) + "\n\n"
 
-    if context or goals_block:
+    if context or tasks_block:
         print(
-            f"{goals_block}"
+            f"{tasks_block}"
             f"## Automatisch injizierter Memory-Kontext\n\n{context}\n\n"
             "⚠️  PFLICHT: Gib am Ende jedes Tasks Feedback via "
             "`mcp__claude_ai_Memory__feedback` für jeden genutzten Chunk."

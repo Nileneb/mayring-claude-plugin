@@ -1,7 +1,7 @@
 """Unit tests for the shared robust /memory/put path (_memory_put.py).
 
-Covers the consolidation contract: igio_hint passthrough, 5xx retry then
-queue-with-endpoint, 401→refresh→retry, 4xx drop, device headers.
+Covers the consolidation contract: 5xx retry then queue-with-endpoint,
+401→refresh→retry, 4xx drop, device headers.
 """
 import importlib.util
 import json
@@ -21,7 +21,7 @@ def _http_error(code):
     return urllib.error.HTTPError("http://x/memory/put", code, "err", {}, None)
 
 
-def test_success_passes_igio_hint_and_returns_200():
+def test_success_returns_200_with_correct_body():
     captured = {}
 
     def _fake_urlopen(req, timeout=None):
@@ -34,28 +34,14 @@ def test_success_passes_igio_hint_and_returns_200():
          patch.object(mp.urllib.request, "urlopen", side_effect=_fake_urlopen):
         rc = mp.put_memory("the recap", "conversation_summary:c1",
                            "conversation_summary", "tok",
-                           igio_hint="outcome", categorize=True)
+                           categorize=True)
 
     assert rc == 200
     assert captured["url"].endswith("/memory/put")
-    assert captured["body"]["igio_hint"] == "outcome"
+    assert "igio_hint" not in captured["body"]
     assert captured["body"]["content"] == "the recap"
     assert captured["body"]["categorize"] is True
     assert captured["auth"] == "Bearer tok"
-
-
-def test_no_igio_hint_key_when_absent():
-    captured = {}
-
-    def _fake_urlopen(req, timeout=None):
-        captured["body"] = json.loads(req.data.decode())
-        return MagicMock()
-
-    with patch.object(mp, "device_headers", lambda: {}), \
-         patch.object(mp.urllib.request, "urlopen", side_effect=_fake_urlopen):
-        mp.put_memory("x", "s", "t", "tok")
-
-    assert "igio_hint" not in captured["body"]
 
 
 def test_empty_content_or_token_short_circuits():
@@ -86,7 +72,7 @@ def test_5xx_retries_then_queues_with_endpoint(tmp_path):
          patch.object(mp, "device_headers", lambda: {}), \
          patch.object(mp.time, "sleep", lambda *_: None), \
          patch.object(mp.urllib.request, "urlopen", side_effect=_always_503):
-        rc = mp.put_memory("x", "sid", "stype", "tok", igio_hint="outcome")
+        rc = mp.put_memory("x", "sid", "stype", "tok")
 
     assert rc == 0
     assert len(attempts) == 3  # retried twice
@@ -94,7 +80,7 @@ def test_5xx_retries_then_queues_with_endpoint(tmp_path):
     assert entry["endpoint"] == "/memory/put"   # so the drain hits the right route
     body = json.loads(entry["body"])
     assert body["source_id"] == "sid"
-    assert body["igio_hint"] == "outcome"
+    assert "igio_hint" not in body
 
 
 def test_5xx_with_enqueue_false_does_not_queue(tmp_path):
@@ -121,7 +107,7 @@ def test_401_refreshes_token_then_retries():
     with patch.object(mp, "device_headers", lambda: {}), \
          patch.object(mp, "refresh_token", lambda old, **k: "fresh"), \
          patch.object(mp.urllib.request, "urlopen", side_effect=_fake_urlopen):
-        rc = mp.put_memory("x", "s", "t", "old", igio_hint="outcome")
+        rc = mp.put_memory("x", "s", "t", "old")
 
     assert rc == 200
     assert seen_tokens == ["Bearer old", "Bearer fresh"]

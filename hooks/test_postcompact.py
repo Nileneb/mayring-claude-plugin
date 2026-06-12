@@ -1,4 +1,4 @@
-"""Unit tests for postcompact_hook — recap ingested as the session OUTCOME."""
+"""Unit tests for postcompact_hook — compact summary ingested into Memory."""
 import importlib.util
 import sys
 from pathlib import Path
@@ -11,21 +11,20 @@ pc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pc)
 
 
-def test_recap_ingested_as_outcome():
+def test_recap_ingested_with_categorize():
     posted = {}
 
-    def _fake_put(content, source_id, source_type, token, *, igio_hint=None,
+    def _fake_put(content, source_id, source_type, token, *,
                   categorize=True, **_k):
         posted.update(content=content, source_id=source_id,
-                      source_type=source_type, igio_hint=igio_hint,
-                      categorize=categorize)
+                      source_type=source_type, categorize=categorize)
         return 200
 
     with patch.object(pc, "put_memory", side_effect=_fake_put):
         rc = pc.ingest_recap("session did X and Y", "tok")
 
     assert rc == 200
-    assert posted["igio_hint"] == "outcome"          # recap IS the outcome
+    assert "igio_hint" not in posted
     assert posted["source_type"] == "conversation_summary"
     assert posted["source_id"].startswith("conversation_summary:compact-")
     assert posted["categorize"] is True

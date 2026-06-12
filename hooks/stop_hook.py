@@ -72,12 +72,10 @@ try:
     from _memory_put import put_memory
 except ImportError:
     # Standalone-snapshot fallback: single-shot POST, no retry/queue/refresh.
-    def put_memory(content, source_id, source_type, token, *, igio_hint=None,
+    def put_memory(content, source_id, source_type, token, *,
                    categorize=True, **_k):  # type: ignore[misc]
         body = {"source_id": source_id, "source_type": source_type,
                 "content": content, "categorize": categorize}
-        if igio_hint:
-            body["igio_hint"] = igio_hint
         try:
             req = urllib.request.Request(
                 f"{_API_URL}/memory/put", data=json.dumps(body).encode(),
@@ -115,11 +113,6 @@ _PATH_KEY_MIN_LEN = 5       # avoid spurious matches on tiny basenames
 # in the transcript JSONL — without the file, the Stop hook would never
 # see what was injected. See memory_inject._write_inject_state.
 _INJECT_STATE_DIR = os.path.expanduser("~/.config/mayring/inject-state")
-
-# Per-session marker of the last session-goal we ingested → avoids re-POSTing an
-# unchanged /goal every turn. Advances ONLY on a successful POST, so a failed POST
-# is automatically retried next turn (the goal is still active in the transcript).
-_SESSION_GOAL_STATE = os.path.expanduser("~/.config/mayring/session-goal-state.json")
 
 # Legacy regex kept for transcripts that DO contain the block inline
 # (e.g. paste-ins, debugging). New canonical source is the state file.
@@ -296,41 +289,14 @@ def extract_turn_actions(transcript_path: str) -> list[str]:
     return actions[-_ACTION_LIMIT:]
 
 
-_IGIO_FAST_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
-    (re.compile(r"\b(ziel|goal|goals|objective|objectives|wir\s+wollen|we\s+want|anstreben|vorhaben|soll\s+sein)\b", re.I), "goal"),
-    (re.compile(r"\b(bug|fehler|problem|issue|broken|regression|traceback|error|exception|kaputt|falsch)\b", re.I), "issue"),
-    (re.compile(r"\b(implementier|refactor|bauen|build|fix|deploy|migrate|schreib|erstell|ändere|update)\b", re.I), "intervention"),
-    (re.compile(r"\b(ergebnis|result|outcome|test\s+grün|tests?\s+pass|fertig|done|abgeschlossen|deployed)\b", re.I), "outcome"),
-)
-_IGIO_PRIORITY = ("issue", "goal", "intervention", "outcome")
-
-
-def _igio_fast_hint(text: str) -> str | None:
-    """Regex-only IGIO axis detection — no LLM, <1ms. Returns axis or None."""
-    if not text:
-        return None
-    scores: dict[str, int] = {}
-    for pattern, axis in _IGIO_FAST_PATTERNS:
-        scores[axis] = scores.get(axis, 0) + len(pattern.findall(text))
-    if not any(scores.values()):
-        return None
-    best_score = max(scores.values())
-    for axis in _IGIO_PRIORITY:
-        if scores.get(axis, 0) == best_score:
-            return axis
-    return None
-
-
 def _post_micro_batch(turns: list[dict], session_id: str, workspace_slug: str, token: str,
-                      igio_hint: str | None = None, project_id: str | None = None,
+                      project_id: str | None = None,
                       origin_ref: str = "", task: str = "") -> int:
     body_dict: dict = {
         "turns": turns,
         "session_id": session_id,
         "workspace_slug": workspace_slug,
     }
-    if igio_hint:
-        body_dict["igio_hint"] = igio_hint
     # B.2 (goal→category): thread the active session-/goal as the categorize task so the
     # server anchors this conversation's inductive categories to the canonical goal
     # (core B.1 upsert_canonical_goal). Empty = unchanged (categories stay goal-less).
@@ -678,13 +644,11 @@ def _capture_turns(payload: dict, token: str) -> list[dict]:
         action_block = "## Aktionen (Tools)\n" + "\n".join(f"- {a}" for a in actions)
         budget = max(0, _MAX_TURN_CHARS - len(action_block) - 2)
         turns[1]["content"] = action_block + "\n\n" + turns[1].get("content", "")[:budget]
-    user_text = turns[0].get("content", "")
-    igio_hint = _igio_fast_hint(user_text)
     _proj_id, _origin_ref = _project_stamp()
-    # B.2: the native session-/goal (same source as capture_session_goal) becomes the
-    # categorize task so the conversation's categories are anchored to the canonical goal.
+    # B.2: the native session-/goal becomes the categorize task so the
+    # conversation's categories are anchored to the canonical goal.
     goal = latest_session_goal(transcript_path)
-    _post_micro_batch(turns, session_id, _workspace_slug(), token, igio_hint=igio_hint,
+    _post_micro_batch(turns, session_id, _workspace_slug(), token,
                       project_id=_proj_id, origin_ref=_origin_ref, task=goal)
     return turns
 
@@ -778,57 +742,6 @@ def latest_session_goal(transcript_path: str) -> str:
     return goal
 
 
-def _read_goal_state() -> dict:
-    try:
-        with open(_SESSION_GOAL_STATE, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return {}
-
-
-def _write_goal_state(state: dict) -> None:
-    try:
-        os.makedirs(os.path.dirname(_SESSION_GOAL_STATE), exist_ok=True)
-        with open(_SESSION_GOAL_STATE, "w", encoding="utf-8") as f:
-            json.dump(state, f)
-    except OSError:
-        pass
-
-
-def capture_session_goal(payload: dict, token: str) -> None:
-    """Erfasst Claudes natives Session-`/goal` → Mayring goal-Achse (igio_axis='goal').
-
-    Das native Goal ist kein Hook-Feld; es liegt als strukturierte ``goal_status``-Zeile
-    im Transcript. Wir ingesten die aktuelle condition als goal-Chunk via /memory/put —
-    ``igio_hint='goal'`` setzt die Achse direkt (bypassed Classifier+SKIP-Gate) und nutzt
-    /memory/goals + IGIO-Lens + Injection unverändert wieder. Idempotent: source_id =
-    hash(goal); per-session-Marker verhindert Re-POST eines unveränderten Goals.
-
-    Läuft über den geteilten put_memory-Pfad (gleicher robuste /memory/put wie der
-    Recap). enqueue=False: der per-turn-Marker IST der Retry-Mechanismus des Goals
-    (advance nur bei 200) — Queueing würde beim nächsten Turn doppelt senden."""
-    import hashlib
-
-    transcript_path = payload.get("transcript_path", "")
-    session_id = payload.get("session_id", "") or "unknown"
-    goal = latest_session_goal(transcript_path)
-    if not goal:
-        return
-    ghash = hashlib.sha256(goal.encode("utf-8")).hexdigest()[:16]
-    state = _read_goal_state()
-    if state.get(session_id) == ghash:
-        return  # unverändert diese Session
-
-    status = put_memory(goal, f"session_goal:{ghash}", "session_goal", token,
-                        igio_hint="goal", categorize=False, enqueue=False)
-    if status == 200:
-        state[session_id] = ghash          # nur bei Erfolg → Retry-next-turn
-        _write_goal_state(state)
-        sys.stderr.write(f"[stop_hook] session-goal → goal axis: {goal[:60]!r}\n")
-    else:
-        sys.stderr.write(f"[stop_hook] session-goal POST status={status} (retry next turn)\n")
-
-
 def main() -> None:
     token = _read_token()
     if not token:
@@ -846,10 +759,6 @@ def main() -> None:
         _auto_feedback(turns, session_id, token)
     except Exception as exc:
         sys.stderr.write(f"[stop_hook] auto_feedback crashed: {type(exc).__name__}: {exc}\n")
-    try:
-        capture_session_goal(payload, token)
-    except Exception as exc:
-        sys.stderr.write(f"[stop_hook] capture_session_goal crashed: {type(exc).__name__}: {exc}\n")
 
 
 if __name__ == "__main__":

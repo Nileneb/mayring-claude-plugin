@@ -87,7 +87,6 @@ def put_memory(
     source_type: str,
     token: str,
     *,
-    igio_hint: str | None = None,
     categorize: bool = True,
     api_url: str = _API_URL,
     timeout: float = _TIMEOUT,
@@ -95,10 +94,6 @@ def put_memory(
     allow_refresh: bool = True,
 ) -> int:
     """POST /memory/put with retry + refresh-on-401 + queue-on-failure.
-
-    ``igio_hint`` sets the IGIO axis directly (bypasses the background
-    classifier's SKIP-gate) — e.g. ``"outcome"`` for the compact recap,
-    ``"goal"`` for the session /goal.
 
     Returns the HTTP status: 200 on success, the 4xx code when dropped
     (no retry can fix a malformed/unknown payload), or 0 on 5xx/network
@@ -113,8 +108,6 @@ def put_memory(
         "content": content,
         "categorize": categorize,
     }
-    if igio_hint:
-        body_dict["igio_hint"] = igio_hint
     body_json = json.dumps(body_dict)
     payload = body_json.encode()
 
