@@ -435,52 +435,6 @@ def _categorize_prompt(prompt: str, token: str = "") -> list[str]:
     return matched
 
 
-def _multi_lens_search(query: str, token: str, *,
-                       category_hint: list[str] | None = None,
-                       project_id: str | None = None,
-                       task_context: str = "",
-                       session_id: str = "") -> dict[str, dict]:
-    """Run the three lens-searches CONCURRENTLY; one entry per lens.
-
-    Each value is either a real search response or a `{_hook_error: ...}`
-    sentinel. Lenses that don't finish within GLOBAL_TIMEOUT keep their
-    pre-seeded sentinel.
-    """
-    lenses: dict[str, dict] = {
-        "primary":      {"category_hint": category_hint, "project_id": project_id,
-                          "task_context": task_context, "session_id": session_id},
-        "ambient":      {"source_type": "ambient_snapshot", "top_k": TOP_K_LENS,
-                          "char_budget": 1000, "project_id": project_id},
-        "conversation": {"source_type": "conversation_summary", "top_k": TOP_K_LENS,
-                          "char_budget": 1000, "project_id": project_id},
-    }
-    results: dict[str, dict] = {n: {"_hook_error": "lens did not complete in time"}
-                                for n in lenses}
-    # WHY(2026-05-30 lens-starvation): the lenses were made SEQUENTIAL on
-    # 2026-05-24 because the cloud API was a SINGLE uvicorn worker. It is now
-    # `--workers 4` (api-concurrency-capacity) — sized SPECIFICALLY for the 3
-    # parallel lens searches — but the hook was never switched back. Sequential +
-    # 9s/lens overran the 12s GLOBAL_TIMEOUT so ambient + conversation starved
-    # (the "lens did not complete in time" you saw every prompt). Concurrent
-    # again: all three finish in ~max(9s) and fit the budget. Bounded by
-    # as_completed(timeout=GLOBAL_TIMEOUT); unfinished lenses keep their sentinel.
-    from concurrent.futures import (ThreadPoolExecutor, as_completed,
-                                    TimeoutError as _FutureTimeout)
-    with ThreadPoolExecutor(max_workers=len(lenses)) as ex:
-        futs = {ex.submit(_search, query, token, **kw): name
-                for name, kw in lenses.items()}
-        try:
-            for fut in as_completed(futs, timeout=GLOBAL_TIMEOUT):
-                name = futs[fut]
-                try:
-                    results[name] = fut.result()
-                except Exception as exc:
-                    results[name] = {"_hook_error": f"{type(exc).__name__}: {exc}"}
-        except _FutureTimeout:
-            pass  # unfinished lenses keep their pre-seeded sentinel
-    return results
-
-
 def _write_inject_state(
     session_id: str,
     chunk_pairs: list[tuple[str, str]],
