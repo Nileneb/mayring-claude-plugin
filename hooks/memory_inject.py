@@ -238,6 +238,72 @@ def _search(
     return {"_hook_error": last_err or "unknown"}
 
 
+# WHY(2026-06-20 task-anchor): the 3 lenses fired the SAME raw prompt query (only
+# source_type filters differed) → 3× the same embedding + the derived task thrown
+# away. ONE task-anchored search replaces them: the server distills prompt→task
+# (the measured +13pp anchor), runs one search, logs the clean corpus row. The full
+# decomposition loop measured 12-15s (too slow for the 9s budget) → anchor_only here,
+# full loop stays on the act-path MCP tool.
+TASK_TIMEOUT = 11.0  # one call, no 3-lens parallelism; within GLOBAL_TIMEOUT
+
+
+def _task_anchored_search(
+    query: str, token: str, *, top_k: int = 6, char_budget: int = 4500,
+    category_hint: list[str] | None = None, project_id: str | None = None,
+    session_id: str = "",
+) -> dict:
+    """One /memory/task-search?anchor_only call. Returns the response
+    ({task, results, prompt_context, diagnostics}) or a {_hook_error} sentinel —
+    same contract as _search so the inject render path is unchanged."""
+    body_dict: dict = {
+        "query": query[:600],
+        "anchor_only": True,
+        "top_k": top_k,
+        "char_budget": char_budget,
+    }
+    if category_hint:
+        body_dict["category_hint"] = category_hint
+    if project_id:
+        body_dict["project"] = project_id
+    if session_id:
+        body_dict["session_id"] = session_id
+    body = json.dumps(body_dict).encode()
+    req = urllib.request.Request(
+        f"{API}/memory/task-search",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            **device_headers(),
+        },
+    )
+    backoff = 1.0
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(req, timeout=TASK_TIMEOUT) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            if e.code in (502, 503, 504) and attempt < 3:
+                _time.sleep(backoff)
+                backoff *= 2
+                continue
+            return {"_hook_error": f"HTTP {e.code} from /memory/task-search",
+                    "_status": e.code}
+        except TimeoutError:
+            return {"_hook_error": f"TIMEOUT after {TASK_TIMEOUT}s — server slow or down"}
+        except urllib.error.URLError as e:
+            if attempt < 3:
+                _time.sleep(backoff)
+                backoff *= 2
+                continue
+            return {"_hook_error": f"URLError: {e.reason}"}
+        except OSError as e:
+            return {"_hook_error": f"OSError {e.errno}: {e.strerror}"}
+        except ValueError as e:
+            return {"_hook_error": f"JSON parse error: {e}"}
+    return {"_hook_error": "unknown"}
+
+
 _CATEGORIZE_OLLAMA = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 # WHY(no-hardcoded-model 2026-06-08): empty = let the server ModelRouter pick the text
 # model (per CLAUDE.md; was hardcoded qwen3.5-mayring:2b). Only an explicit env override
@@ -551,7 +617,17 @@ def main() -> None:
             active["cwd_remote"] = _cur_remote
             _write_session_ctx_field("active_project", active)
     project_id = (active or {}).get("project_id")
-    task = _derive_task(prompt, (active or {}).get("name") or "")
+
+    # ONE task-anchored search replaces the 3 redundant same-query lenses (the
+    # server distills prompt→task and runs a single search). results keeps the
+    # {"primary": ...} shape so the render/persist path below is unchanged;
+    # ambient/conversation lenses are gone (the task anchor + recency-lane cover them).
+    results = {"primary": _task_anchored_search(
+        prompt, token, category_hint=prompt_categories or None,
+        project_id=project_id, session_id=payload.get("session_id", ""))}
+    primary = results.get("primary") or {}
+    task = (primary.get("task") or "") if "_hook_error" not in primary else ""
+
     if active and project_id:
         proj_line = (f"📁 Projekt: {active.get('name') or project_id} "
                      f"({active.get('mode', '?')}, conf={active.get('confidence', 0)} "
@@ -560,11 +636,6 @@ def main() -> None:
     else:
         proj_line = f"📁 Projekt: — (workspace-weit, {(active or {}).get('mode', '?')})\n\n"
     pinned_prefix = proj_line + pinned_prefix
-
-    results = _multi_lens_search(prompt, token, category_hint=prompt_categories or None,
-                                 project_id=project_id, task_context=task,
-                                 session_id=payload.get("session_id", ""))
-    primary = results.get("primary") or {}
     if "_hook_error" in primary:
         # Sonderfall: deploy-typische 5xx (502/503/504) sind transient
         # — der Stack restartet gerade, in 10s ist alles wieder gut.
