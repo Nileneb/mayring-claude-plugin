@@ -9,6 +9,7 @@ Two-phase per session:
 """
 from __future__ import annotations
 
+import hashlib
 import glob
 import json
 import os
@@ -143,19 +144,39 @@ def _venv_is_healthy(venv_dir: str) -> bool:
     return os.path.isfile(real)
 
 
+def _requirements_stamp(requirements: str) -> str:
+    with open(requirements, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
+
+
+def _venv_deps_current(venv_dir: str, requirements: str) -> bool:
+    # WHY: _venv_is_healthy() only checks that the interpreter binaries exist —
+    # an empty venv (created but never `pip install`ed) passes it, so deps would
+    # never land and hooks fall back to ambient (base) python. Stamp the venv
+    # with the requirements hash and reinstall on drift.
+    stamp = os.path.join(venv_dir, ".requirements-stamp")
+    if not os.path.isfile(stamp):
+        return False
+    try:
+        with open(stamp, "r", encoding="utf-8") as fh:
+            return fh.read().strip() == _requirements_stamp(requirements)
+    except OSError:
+        return False
+
+
 def _ensure_venv(plugin_root: str, repo_root: str) -> None:
     venv_dir = os.path.join(plugin_root, ".venv")
     requirements = os.path.join(repo_root, "requirements-client.txt")
-    if _venv_is_healthy(venv_dir):
-        return
     if not os.path.isfile(requirements):
         print(
             f"MayringCoder bootstrap: skipped (no {requirements}); is the marketplace clone complete?",
             file=sys.stderr,
         )
         return
+    if _venv_is_healthy(venv_dir) and _venv_deps_current(venv_dir, requirements):
+        return
     print(
-        f"MayringCoder bootstrap: creating venv at {venv_dir} (one-time, ~30-60s)",
+        f"MayringCoder bootstrap: building isolated venv at {venv_dir} (one-time, ~30-60s)",
         file=sys.stderr,
     )
     try:
@@ -171,6 +192,8 @@ def _ensure_venv(plugin_root: str, repo_root: str) -> None:
             check=True,
             capture_output=True,
         )
+        with open(os.path.join(venv_dir, ".requirements-stamp"), "w", encoding="utf-8") as fh:
+            fh.write(_requirements_stamp(requirements))
         print("MayringCoder bootstrap: venv ready", file=sys.stderr)
     except subprocess.CalledProcessError as e:
         print(

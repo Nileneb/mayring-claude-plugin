@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/session_start.py"
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/hook_runner.sh ${CLAUDE_PLUGIN_ROOT}/hooks/session_start.py"
           }
         ]
       }
@@ -18,19 +18,19 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/memory_inject.py"
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/hook_runner.sh ${CLAUDE_PLUGIN_ROOT}/hooks/memory_inject.py"
           },
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/start_watcher.py"
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/hook_runner.sh ${CLAUDE_PLUGIN_ROOT}/hooks/start_watcher.py"
           },
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/memory_sync.py"
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/hook_runner.sh ${CLAUDE_PLUGIN_ROOT}/hooks/memory_sync.py"
           },
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/ci_security_warner.py"
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/hook_runner.sh ${CLAUDE_PLUGIN_ROOT}/hooks/ci_security_warner.py"
           }
         ]
       }
@@ -41,7 +41,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/postcompact_hook.py"
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/hook_runner.sh ${CLAUDE_PLUGIN_ROOT}/hooks/postcompact_hook.py"
           }
         ]
       }
@@ -52,7 +52,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/stop_hook.py"
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/hook_runner.sh ${CLAUDE_PLUGIN_ROOT}/hooks/stop_hook.py"
           }
         ]
       }
@@ -63,7 +63,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/task_capture.py"
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/hook_runner.sh ${CLAUDE_PLUGIN_ROOT}/hooks/task_capture.py"
           }
         ]
       }
